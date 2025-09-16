@@ -1,0 +1,1 @@
+# Data fetching logic is already included in the data_collector_agent.py

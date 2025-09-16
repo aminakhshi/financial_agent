@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: financial_data
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - financial_net
+
+  # Redis for caching and task queue
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - financial_net
+
+  # Ollama for local LLM
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - financial_net
+    command: >
+      sh -c "ollama serve &
+             sleep 10 &&
+             ollama pull llama3:8b &&
+             ollama pull mistral:7b &&
+             wait"
+
+  # Main application
+  financial_app:
+    build: .
+    depends_on:
+      - postgres
+      - redis
+      - ollama
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=financial_data
+      - DB_USER=postgres
+      - DB_PASSWORD=password
+    ports:
+      - "8501:8501"  # Streamlit dashboard
+    volumes:
+      - ./src:/app/src
+      - ./models:/app/models
+      - ./logs:/app/logs
+    networks:
+      - financial_net
+
+volumes:
+  postgres_data:
+  ollama_data:
+
+networks:
+  financial_net:
+    driver: bridge
