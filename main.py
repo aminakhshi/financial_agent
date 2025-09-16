@@ -13,7 +13,7 @@ def setup_database():
     """Initialize database and create tables"""
     db_manager = DatabaseManager(DATABASE_CONFIG)
     db_manager.create_tables()
-    print("✅ Database initialized")
+    print("Database initialized")
     return db_manager
 
 def setup_agents(db_manager):
@@ -28,18 +28,18 @@ def setup_agents(db_manager):
     # Initialize components
     data_collector = DataCollectorAgent(config, db_manager)
     ml_predictor = LSTMPredictor(config)
-    orchestrator = OrchestratorAgent(config, db_manager, data_collector, ml_predictor)
+    orchestrator = AutomationAgent(config, db_manager, data_collector, ml_predictor)
     
-    print("✅ All agents initialized")
+    print("All agents initialized")
     return orchestrator
 
 def run_dashboard():
-    """Run the Streamlit dashboard in a separate process"""
+    """Run the dashboard separately"""
     subprocess.run(['streamlit', 'run', 'dashboard/app.py', '--server.port', '8501'])
 
 async def main():
-    """Main application entry point"""
-    print("🚀 Starting AI Financial Market Predictor Pipeline")
+    """Main application function"""
+    print("Starting pipeline")
     print("=" * 60)
     
     # Setup
@@ -51,28 +51,28 @@ async def main():
     dashboard_thread.daemon = True
     dashboard_thread.start()
     
-    print("🌐 Dashboard started at: http://localhost:8501")
+    print("Dashboard started at: http://localhost:8501")
     
     # Initial full pipeline run
-    print("🔄 Running initial pipeline...")
+    print("Running initial pipeline...")
     initial_results = await orchestrator.run_full_pipeline()
-    print("✅ Initial pipeline completed")
+    print("Initial pipeline completed")
     
     # Start scheduled operations
-    print("📅 Starting scheduled operations...")
+    print(" Starting scheduled operations...")
     
-    # This will run continuously
+    # Run continuously
     try:
         orchestrator.schedule_operations()
     except KeyboardInterrupt:
-        print("\n🛑 Pipeline stopped by user")
+        print("\n Pipeline stopped by user")
     except Exception as e:
-        print(f"❌ Error in pipeline: {e}")
+        print(f" Error in pipeline: {e}")
 
 if __name__ == "__main__":
-    # Ensure required directories exist
+    # Create directories 
     os.makedirs("models/saved", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
     
-    # Run main application
+    # Run the application
     asyncio.run(main())
