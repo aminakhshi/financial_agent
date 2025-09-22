@@ -2,6 +2,7 @@
 langchain>=0.1.0
 crewai>=0.28.0
 autogen-agentchat>=0.2.0
+langchain-community>=0.3.20
 
 # Open-source LLM support
 openai>=1.0.0

@@ -1,0 +1,36 @@
+name: Financial Agent Workflow
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      
+      - name: Run tests
+        env:
+          API_KEY_ALPHAVANTAGE: ${{ secrets.API_KEY_ALPHAVANTAGE }}
+          API_KEY_FINANCIALMODELINGPREP: ${{ secrets.API_KEY_FINANCIALMODELINGPREP }}
+          API_KEY_NEWS: ${{ secrets.API_KEY_NEWS }}
+          API_KEY_POLYGON: ${{ secrets.API_KEY_POLYGON }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          # Your test command here
+          echo "Running tests with secure environment variables"

@@ -1,7 +1,23 @@
 import os
 from dotenv import load_dotenv
+from pathlib import Path
 
 load_dotenv()
+
+# Base directory
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+# API Keys - load from environment variables to work with GitHub Secrets
+API_KEY_ALPHAVANTAGE = os.environ.get("API_KEY_ALPHAVANTAGE", "")
+API_KEY_FINANCIALMODELINGPREP = os.environ.get("API_KEY_FINANCIALMODELINGPREP", "")
+API_KEY_NEWS = os.environ.get("API_KEY_NEWS", "")
+API_KEY_POLYGON = os.environ.get("API_KEY_POLYGON", "")
+
+# Database settings
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///../financial_data.db")
+
+# Model settings
+MODEL_SAVE_PATH = os.path.join(BASE_DIR, "models", "saved")
 
 # Database configuration
 DATABASE_CONFIG = {
