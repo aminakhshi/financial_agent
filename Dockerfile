@@ -19,8 +19,8 @@ COPY . .
 EXPOSE 8501
 
 # Set environment variables
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app/src
 ENV STREAMLIT_SERVER_PORT=8501
 
 # Run the application
-CMD ["python", "main.py"]
+CMD ["python", "src/main.py"]

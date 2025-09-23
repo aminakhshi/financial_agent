@@ -30,9 +30,12 @@ DATABASE_CONFIG = {
 
 # API keys
 API_KEYS = {
-    'alpha_vantage': os.getenv('ALPHA_VANTAGE_API_KEY'),
-    'openai': os.getenv('OPENAI_API_KEY'),
-    'huggingface': os.getenv('HUGGINGFACE_API_KEY')
+    'ALPHAVANTAGE': os.getenv('API_KEY_ALPHAVANTAGE'),
+    'FINANCIALMODELINGPREP': os.getenv('API_KEY_FINANCIALMODELINGPREP'),
+    'NEWS': os.getenv('API_KEY_NEWS'),
+    'POLYGON': os.getenv('API_KEY_POLYGON'),
+    'OPENAI': os.getenv('OPENAI_API_KEY'),
+    'HUGGINGFACE': os.getenv('HUGGINGFACE_API_KEY')
 }
 
 # LLM configuration

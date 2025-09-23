@@ -1,3 +1,10 @@
+# Local test files
+test_*.sh
+terminal_*.sh
+SECURITY_SETUP.md
+env.example
+.env*
+
 # Environment variables
 .env
 .env.local
