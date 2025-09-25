@@ -1,9 +1,6 @@
 # Local test files
-test_*.sh
-terminal_*.sh
 SECURITY_SETUP.md
-env.example
-.env*
+wrds.*
 
 # Environment variables
 .env
@@ -56,3 +53,7 @@ models/saved/
 # OS specific
 .DS_Store
 Thumbs.db
+
+# Spyder project settings
+.spyderproject
+.spyproject
