@@ -1,6 +1,6 @@
 # Local test files
 SECURITY_SETUP.md
-wrds.*
+wrds_*
 
 # Environment variables
 .env

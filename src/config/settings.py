@@ -7,7 +7,7 @@ load_dotenv()
 # Base directory
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
-# API Keys - load from environment variables to work with GitHub Secrets
+# API Keys - load from environment variables
 API_KEY_ALPHAVANTAGE = os.environ.get("API_KEY_ALPHAVANTAGE", "")
 API_KEY_FINANCIALMODELINGPREP = os.environ.get("API_KEY_FINANCIALMODELINGPREP", "")
 API_KEY_NEWS = os.environ.get("API_KEY_NEWS", "")
@@ -40,10 +40,11 @@ API_KEYS = {
 
 # LLM configuration
 LLM_CONFIG = {
-    'model_name': 'llama3:8b',  # or 'mistral:7b'
+    'model_name': 'ollama/gpt-oss:20b',  # Added ollama/ prefix
     'temperature': 0.1,
     'max_tokens': 2048,
-    'base_url': 'http://localhost:11434'  # Ollama server
+    'base_url': 'http://localhost:11434',  # Ollama server
+    'provider': 'ollama'  # Specify the provider
 }
 
 # Market data configuration

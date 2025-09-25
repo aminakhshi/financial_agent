@@ -2,22 +2,70 @@ import yfinance as yf
 import pandas as pd
 from alpha_vantage.timeseries import TimeSeries
 from langchain.agents import initialize_agent, Tool
-from langchain.llms import Ollama
 from datetime import datetime, timedelta
 import asyncio
 import schedule
 import time
 
+
 class DataCollectorAgent:
     def __init__(self, config, db_manager):
         self.config = config
         self.db_manager = db_manager
-        self.llm = Ollama(
-            model=config['LLM_CONFIG']['model_name'],
-            base_url=config['LLM_CONFIG']['base_url']
-        )
+        try:
+            # replace deprecated Ollama class
+            # from langchain_community.llms import Ollama
+            from langchain_ollama import ChatOllama
+            self.llm = ChatOllama(
+                model=config['LLM_CONFIG']['model_name'],
+                base_url=config['LLM_CONFIG']['base_url']
+                )
+            # self.llm = Ollama(
+            #     model=config['LLM_CONFIG']['model_name'],
+            #     base_url=config['LLM_CONFIG']['base_url']
+            # )
+            print(f"Data collector agent using: {config['LLM_CONFIG']['model_name']}")
+        except Exception as e:
+            try:
+                # fallback to using OpenAI
+                from langchain_openai import ChatOpenAI
+                openai_api_key = config['API_KEYS'].get('OPENAI_API_KEY') or config['API_KEYS'].get('OPENAI')
+                if openai_api_key:
+                    self.llm = ChatOpenAI(
+                        temperature=config['LLM_CONFIG'].get('temperature', 0.1),
+                        openai_api_key=openai_api_key
+                    )
+                    print(f"Data collector agent using is {config['LLM_CONFIG']['model_name']}. Be careful of the charges!")
+            except Exception as e2:
+                print(f"⚠️ Cannot connect data collector agent")
+                print("⚠ Running in non-LLM mode with limited functionality")
+
+            # Create a custom LLM that will work with litellm
+            from langchain.llms.base import LLM
+            from typing import Optional, List, Dict, Any
+            
+            class SimpleMockLLM(LLM):
+                """A very simple mock LLM implementation."""
+                model_name: str = "fake-llm"
+                provider: str = "fake-provider"
+                
+                def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs) -> str:
+                    return "Mock response for testing"
+                
+                @property
+                def _llm_type(self) -> str:
+                    """Return type of LLM."""
+                    return "simple_mock"
+                    
+                @property
+                def _identifying_params(self) -> Dict[str, Any]:
+                    return {"model_name": self.model_name, "provider": self.provider}
+            
+            self.llm = SimpleMockLLM()
+            
+        alpha_vantage_key = config['API_KEYS'].get('ALPHA_VANTAGE_API_KEY') or config['API_KEYS'].get('ALPHAVANTAGE') or 'demo'
         self.alpha_vantage = TimeSeries(
-            key=config['API_KEYS']['alpha_vantage'],
+            key=alpha_vantage_key,
             output_format='pandas'
         )
         
