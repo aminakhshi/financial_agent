@@ -1,12 +1,19 @@
-from langchain.agents import initialize_agent, Tool
-from langchain_community.llms import Ollama
-from langchain.memory import ConversationBufferMemory
 from crewai import Agent, Task, Crew
 import asyncio
 from datetime import datetime, timedelta
+import os
+
+try:
+    from langchain.agents import initialize_agent, Tool  # noqa: F401
+except ImportError:
+    initialize_agent = None
+    Tool = None
 
 # Added imports for the custom LLM
-from langchain.llms.base import LLM
+try:
+    from langchain.llms.base import LLM
+except ImportError:
+    from langchain_core.language_models.llms import LLM
 from typing import Optional, List, Dict, Any
 
 class AutomationAgent:
@@ -22,7 +29,7 @@ class AutomationAgent:
             self.llm = ChatOllama(
                 model=config['LLM_CONFIG']['model_name'],
                 base_url=config['LLM_CONFIG']['base_url'],
-                #request_timeout=1200.0  # 20-minute timeout
+                request_timeout=float(os.getenv('LLM_REQUEST_TIMEOUT', '120')),
                 )
             print(f"Connected the {config['LLM_CONFIG']['model_name']}")
             print(f"   at {config['LLM_CONFIG']['base_url']}")
@@ -64,7 +71,6 @@ class AutomationAgent:
 
                 self.llm = SimpleMockLLM()
 
-        self.memory = ConversationBufferMemory(memory_key="chat_history")
         self.setup_crew_agents()
 
     def setup_crew_agents(self):

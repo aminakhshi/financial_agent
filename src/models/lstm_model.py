@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import hashlib
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
@@ -164,13 +165,37 @@ class LSTMPredictor:
         """Save model and scaler"""
         model_dir = f"models/saved/{symbol}"
         os.makedirs(model_dir, exist_ok=True)
+        scaler_path = f"{model_dir}/scaler.pkl"
+        scaler_hash_path = f"{model_dir}/scaler.pkl.sha256"
         
         self.model.save(f"{model_dir}/lstm_model.h5")
-        joblib.dump(self.scaler, f"{model_dir}/scaler.pkl")
+        joblib.dump(self.scaler, scaler_path)
+
+        with open(scaler_path, "rb") as f:
+            scaler_hash = hashlib.sha256(f.read()).hexdigest()
+        with open(scaler_hash_path, "w", encoding="utf-8") as f:
+            f.write(scaler_hash)
         
     def load_model(self, symbol):
         """Load saved model and scaler"""
         model_dir = f"models/saved/{symbol}"
+        scaler_path = f"{model_dir}/scaler.pkl"
+        scaler_hash_path = f"{model_dir}/scaler.pkl.sha256"
         
         self.model = tf.keras.models.load_model(f"{model_dir}/lstm_model.h5")
-        self.scaler = joblib.load(f"{model_dir}/scaler.pkl")
+
+        if not os.path.exists(scaler_hash_path):
+            raise FileNotFoundError(
+                f"Missing scaler integrity file: {scaler_hash_path}. "
+                "Refuse to load unsigned scaler artifact."
+            )
+
+        with open(scaler_hash_path, "r", encoding="utf-8") as f:
+            expected_hash = f.read().strip()
+        with open(scaler_path, "rb") as f:
+            actual_hash = hashlib.sha256(f.read()).hexdigest()
+
+        if actual_hash != expected_hash:
+            raise ValueError("Scaler artifact integrity check failed.")
+
+        self.scaler = joblib.load(scaler_path)

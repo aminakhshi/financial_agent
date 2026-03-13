@@ -4,6 +4,13 @@ from pathlib import Path
 
 load_dotenv()
 
+
+def get_required_env(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
 # Base directory
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -14,7 +21,7 @@ API_KEY_NEWS = os.environ.get("API_KEY_NEWS", "")
 API_KEY_POLYGON = os.environ.get("API_KEY_POLYGON", "")
 
 # Database settings
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///../financial_data.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # Model settings
 MODEL_SAVE_PATH = os.path.join(BASE_DIR, "models", "saved")
@@ -25,7 +32,7 @@ DATABASE_CONFIG = {
     'port': os.getenv('DB_PORT', '5432'),
     'database': os.getenv('DB_NAME', 'financial_data'),
     'user': os.getenv('DB_USER', 'postgres'),
-    'password': os.getenv('DB_PASSWORD', 'password')
+    'password': get_required_env('DB_PASSWORD')
 }
 
 # API keys
@@ -40,11 +47,11 @@ API_KEYS = {
 
 # LLM configuration
 LLM_CONFIG = {
-    'model_name': 'ollama/gpt-oss:20b',  # Added ollama/ prefix
-    'temperature': 0.1,
-    'max_tokens': 2048,
-    'base_url': 'http://localhost:11434',  # Ollama server
-    'provider': 'ollama'  # Specify the provider
+    'model_name': os.getenv('LLM_MODEL_NAME', 'gpt-oss:20b'),
+    'temperature': float(os.getenv('LLM_TEMPERATURE', '0.1')),
+    'max_tokens': int(os.getenv('LLM_MAX_TOKENS', '2048')),
+    'base_url': os.getenv('LLM_BASE_URL', 'http://localhost:11434'),
+    'provider': os.getenv('LLM_PROVIDER', 'ollama')
 }
 
 # Market data configuration

@@ -1,11 +1,39 @@
 import yfinance as yf
 import pandas as pd
 from alpha_vantage.timeseries import TimeSeries
-from langchain.agents import initialize_agent, Tool
 from datetime import datetime, timedelta
 import asyncio
 import schedule
 import time
+import os
+
+try:
+    from langchain.llms.base import LLM as BaseLLM
+except ImportError:
+    from langchain_core.language_models.llms import LLM as BaseLLM
+
+try:
+    from langchain.agents import initialize_agent, Tool
+except ImportError:
+    class Tool:  # pragma: no cover - compatibility shim
+        def __init__(self, name, func, description):
+            self.name = name
+            self.func = func
+            self.description = description
+
+    class _FallbackToolRunner:
+        def __init__(self, tools):
+            self._tool_map = {t.name: t.func for t in tools}
+
+        def run(self, prompt):
+            return (
+                "initialize_agent is unavailable in the installed langchain version. "
+                "Use direct methods like fetch_yfinance_data/fetch_alpha_vantage_data/store_market_data. "
+                f"Prompt was: {prompt[:180]}"
+            )
+
+    def initialize_agent(tools, llm, agent_type=None, verbose=False):
+        return _FallbackToolRunner(tools)
 
 
 class DataCollectorAgent:
@@ -18,7 +46,8 @@ class DataCollectorAgent:
             from langchain_ollama import ChatOllama
             self.llm = ChatOllama(
                 model=config['LLM_CONFIG']['model_name'],
-                base_url=config['LLM_CONFIG']['base_url']
+                base_url=config['LLM_CONFIG']['base_url'],
+                request_timeout=float(os.getenv('LLM_REQUEST_TIMEOUT', '120'))
                 )
             # self.llm = Ollama(
             #     model=config['LLM_CONFIG']['model_name'],
@@ -41,10 +70,9 @@ class DataCollectorAgent:
                 print("⚠ Running in non-LLM mode with limited functionality")
 
             # Create a custom LLM that will work with litellm
-            from langchain.llms.base import LLM
             from typing import Optional, List, Dict, Any
             
-            class SimpleMockLLM(LLM):
+            class SimpleMockLLM(BaseLLM):
                 """A very simple mock LLM implementation."""
                 model_name: str = "fake-llm"
                 provider: str = "fake-provider"

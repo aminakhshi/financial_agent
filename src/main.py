@@ -13,9 +13,16 @@ from models.lstm_model import LSTMPredictor
 from dashboard.app import main as dashboard_main
 import subprocess
 
+
+def _sqlite_fallback_enabled():
+    return os.getenv("ENABLE_SQLITE_FALLBACK", "false").strip().lower() == "true"
+
 def setup_database():
     """This function creates the database and necessary tables"""
-    db_manager = DatabaseManager(DATABASE_CONFIG, use_sqlite_fallback=True)
+    db_manager = DatabaseManager(
+        DATABASE_CONFIG,
+        use_sqlite_fallback=_sqlite_fallback_enabled(),
+    )
     db_manager.create_tables()
     logger.success("Database setup successful!")
     return db_manager

@@ -154,7 +154,8 @@ def main():
         It works both with PostgreSQL and SQLite.
         """
         st.info("Connecting to the database...")
-        db_manager = DatabaseManager(DATABASE_CONFIG, use_sqlite_fallback=True)
+        sqlite_fallback = os.getenv("ENABLE_SQLITE_FALLBACK", "false").strip().lower() == "true"
+        db_manager = DatabaseManager(DATABASE_CONFIG, use_sqlite_fallback=sqlite_fallback)
         st.success(f"Connected to {'SQLite' if db_manager.is_sqlite else 'PostgreSQL'}!")
         return db_manager
 

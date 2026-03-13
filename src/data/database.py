@@ -92,7 +92,10 @@ def _get_db_url() -> str:
 
 
 class DatabaseManager:
-    def __init__(self, config=None, use_sqlite_fallback=True):
+    def __init__(self, config=None, use_sqlite_fallback=False):
+        # Expose model classes for callers that reference them via manager instance.
+        self.MarketData = MarketData
+        self.PredictionResults = PredictionResults
         try:
             if config is None:
                 # fall back to env 
@@ -108,10 +111,15 @@ class DatabaseManager:
                 )
 
             self.is_sqlite = False
-            self.engine = create_engine(
-                db_url, pool_pre_ping=True, pool_recycle=1800, future=True,
-                connect_args={"connect_timeout": 5},
-            )
+            engine_kwargs = {
+                "pool_pre_ping": True,
+                "pool_recycle": 1800,
+                "future": True,
+            }
+            if db_url.startswith("postgresql"):
+                engine_kwargs["connect_args"] = {"connect_timeout": 5}
+            self.engine = create_engine(db_url, **engine_kwargs)
+            self.is_sqlite = db_url.startswith("sqlite")
         except Exception as e:
             if use_sqlite_fallback:
                 print("\nWARNING: Unable to connect to PostgreSQL database. Falling back to SQLite.")
@@ -138,9 +146,10 @@ class DatabaseManager:
                 return
             except OperationalError as e:
                 if "database" in str(e) and "does not exist" in str(e):
+                    db_user = os.getenv("DB_USER", "postgres")
                     print("\nERROR: Database does not exist. Please create it manually with:")
                     print("sudo -u postgres psql -c \"CREATE DATABASE financial_data;\"")
-                    print("sudo -u postgres psql -c \"GRANT ALL PRIVILEGES ON DATABASE financial_data TO amin;\"\n")
+                    print(f"sudo -u postgres psql -c \"GRANT ALL PRIVILEGES ON DATABASE financial_data TO {db_user};\"\n")
                     print("Attempting to use SQLite as fallback...")
                     
                     # Create a SQLite connection instead

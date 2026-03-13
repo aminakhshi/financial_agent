@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.local
+.env.*.local
+logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+.ipynb_checkpoints/
+models/saved/
