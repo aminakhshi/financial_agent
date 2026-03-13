@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 import hashlib
+import json
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
@@ -21,7 +22,7 @@ class LSTMPredictor:
     def prepare_features(self, df):
         """Prepare technical indicators and features"""
         # Sort by timestamp
-        df = df.sort_values('timestamp')
+        df = df.sort_values('timestamp').copy()
         
         # Calculate technical indicators
         df['sma_20'] = df['close'].rolling(window=20).mean()
@@ -47,19 +48,30 @@ class LSTMPredictor:
         df['bollinger_lower'] = sma - (std * 2)
         
         # Fill NaN values
-        df = df.fillna(method='bfill').fillna(method='ffill')
+        df = df.bfill().ffill()
         
         return df[self.feature_columns]
     
     def create_sequences(self, data, target_col='close'):
         """Create sequences for LSTM training"""
+        if isinstance(data, pd.DataFrame):
+            values = data.to_numpy(dtype=np.float32, copy=True)
+            target_idx = data.columns.get_loc(target_col)
+        else:
+            values = np.asarray(data, dtype=np.float32)
+            if values.ndim != 2:
+                raise ValueError("Sequence input must be a 2D array.")
+            if isinstance(target_col, str):
+                raise ValueError("target_col must be an integer index when data is not a DataFrame.")
+            target_idx = int(target_col)
+
         X, y = [], []
-        
-        for i in range(self.sequence_length, len(data)):
-            X.append(data[i-self.sequence_length:i])
-            y.append(data[i, data.columns.get_loc(target_col)])
-            
-        return np.array(X), np.array(y)
+
+        for i in range(self.sequence_length, len(values)):
+            X.append(values[i-self.sequence_length:i])
+            y.append(values[i, target_idx])
+
+        return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.float32)
     
     def build_model(self, input_shape):
         """Build LSTM model"""
@@ -86,6 +98,11 @@ class LSTMPredictor:
         """Train the LSTM model"""
         # Prepare features
         features_df = self.prepare_features(df)
+        minimum_rows = self.sequence_length + 24
+        if len(features_df) < minimum_rows:
+            raise ValueError(
+                f"Not enough rows to train {symbol}. Need at least {minimum_rows}, found {len(features_df)}."
+            )
         
         # Scale the data
         scaled_data = self.scaler.fit_transform(features_df)
@@ -93,9 +110,14 @@ class LSTMPredictor:
         
         # Create sequences
         X, y = self.create_sequences(scaled_df)
+        if len(X) < 10:
+            raise ValueError(
+                f"Not enough training sequences for {symbol}. Need at least 10, found {len(X)}."
+            )
         
         # Train-test split
         split_idx = int(len(X) * self.config['MODEL_CONFIG']['train_test_split'])
+        split_idx = min(max(split_idx, 1), len(X) - 1)
         X_train, X_test = X[:split_idx], X[split_idx:]
         y_train, y_test = y[:split_idx], y[split_idx:]
         
@@ -107,29 +129,40 @@ class LSTMPredictor:
             batch_size=self.config['MODEL_CONFIG']['batch_size'],
             epochs=self.config['MODEL_CONFIG']['epochs'],
             validation_data=(X_test, y_test),
-            verbose=1,
+            verbose=0,
             callbacks=[
                 tf.keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True),
                 tf.keras.callbacks.ReduceLROnPlateau(patience=5, factor=0.5)
             ]
         )
-        
+
         # Evaluate model
-        train_pred = self.model.predict(X_train)
-        test_pred = self.model.predict(X_test)
+        train_pred = self.model.predict(X_train, verbose=0)
+        test_pred = self.model.predict(X_test, verbose=0)
         
         train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
         test_rmse = np.sqrt(mean_squared_error(y_test, test_pred))
+        train_mae = mean_absolute_error(y_train, train_pred)
+        test_mae = mean_absolute_error(y_test, test_pred)
         
-        print(f"Training RMSE: {train_rmse:.4f}")
-        print(f"Testing RMSE: {test_rmse:.4f}")
-        
-        # Save model and scaler
-        self.save_model(symbol)
-        
+        metadata = {
+            'symbol': symbol,
+            'train_rmse': float(train_rmse),
+            'test_rmse': float(test_rmse),
+            'train_mae': float(train_mae),
+            'test_mae': float(test_mae),
+            'feature_columns': list(self.feature_columns),
+            'sequence_length': int(self.sequence_length),
+            'training_rows': int(len(features_df)),
+            'trained_at': pd.Timestamp.utcnow().isoformat(),
+            'model_version': pd.Timestamp.utcnow().strftime('%Y%m%d%H%M%S'),
+        }
+
+        # Save model, scaler, and metadata
+        self.save_model(symbol, metadata)
+
         return {
-            'train_rmse': train_rmse,
-            'test_rmse': test_rmse,
+            **metadata,
             'history': history.history
         }
     
@@ -143,13 +176,11 @@ class LSTMPredictor:
         
         # Scale data
         scaled_data = self.scaler.transform(features_df)
-        scaled_df = pd.DataFrame(scaled_data, columns=features_df.columns)
-        
         # Get last sequence
         last_sequence = scaled_data[-self.sequence_length:].reshape(1, self.sequence_length, -1)
         
         # Predict
-        prediction = self.model.predict(last_sequence)
+        prediction = self.model.predict(last_sequence, verbose=0)
         
         # Inverse scale prediction (only for close price)
         close_col_idx = features_df.columns.get_loc('close')
@@ -161,12 +192,13 @@ class LSTMPredictor:
         
         return predicted_price
     
-    def save_model(self, symbol):
+    def save_model(self, symbol, metadata=None):
         """Save model and scaler"""
         model_dir = f"models/saved/{symbol}"
         os.makedirs(model_dir, exist_ok=True)
         scaler_path = f"{model_dir}/scaler.pkl"
         scaler_hash_path = f"{model_dir}/scaler.pkl.sha256"
+        metadata_path = f"{model_dir}/metadata.json"
         
         self.model.save(f"{model_dir}/lstm_model.h5")
         joblib.dump(self.scaler, scaler_path)
@@ -175,6 +207,10 @@ class LSTMPredictor:
             scaler_hash = hashlib.sha256(f.read()).hexdigest()
         with open(scaler_hash_path, "w", encoding="utf-8") as f:
             f.write(scaler_hash)
+
+        if metadata is not None:
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
         
     def load_model(self, symbol):
         """Load saved model and scaler"""
@@ -199,3 +235,11 @@ class LSTMPredictor:
             raise ValueError("Scaler artifact integrity check failed.")
 
         self.scaler = joblib.load(scaler_path)
+
+    def load_metadata(self, symbol):
+        """Load saved training metadata if available."""
+        metadata_path = f"models/saved/{symbol}/metadata.json"
+        if not os.path.exists(metadata_path):
+            return {}
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            return json.load(f)

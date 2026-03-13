@@ -1,352 +1,601 @@
-from crewai import Agent, Task, Crew
 import asyncio
-from datetime import datetime, timedelta
 import os
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+import pandas as pd
+from crewai import Agent
 
 try:
-    from langchain.agents import initialize_agent, Tool  # noqa: F401
-except ImportError:
-    initialize_agent = None
-    Tool = None
+    from loguru import logger
+except Exception:  # pragma: no cover - fallback for minimal environments
+    import logging
 
-# Added imports for the custom LLM
+    logger = logging.getLogger(__name__)
+
 try:
     from langchain.llms.base import LLM
 except ImportError:
     from langchain_core.language_models.llms import LLM
-from typing import Optional, List, Dict, Any
+
 
 class AutomationAgent:
+    """Deterministic market pipeline orchestration for collection, training, and reporting."""
+
+    DEFAULT_SYMBOLS = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA"]
+
     def __init__(self, config, db_manager, data_collector, ml_predictor):
         self.config = config
         self.db_manager = db_manager
         self.data_collector = data_collector
         self.ml_predictor = ml_predictor
+        self.crewai_enabled = os.getenv("DISABLE_CREWAI", "false").strip().lower() != "true"
+        self.default_symbols = self._resolve_symbols(self.DEFAULT_SYMBOLS)
+        self.exchange_lookup = self._build_exchange_lookup()
+        self.llm = self._build_llm()
 
+        if self.crewai_enabled:
+            self.setup_crew_agents()
+        else:
+            logger.info("CrewAI orchestration disabled. Using deterministic pipeline mode.")
+
+    def _build_llm(self):
         try:
-            # replace deprecated Ollama class
-            from langchain_ollama import ChatOllama
-            self.llm = ChatOllama(
-                model=config['LLM_CONFIG']['model_name'],
-                base_url=config['LLM_CONFIG']['base_url'],
-                request_timeout=float(os.getenv('LLM_REQUEST_TIMEOUT', '120')),
-                )
-            print(f"Connected the {config['LLM_CONFIG']['model_name']}")
-            print(f"   at {config['LLM_CONFIG']['base_url']}")
-        except Exception as e:
-            try:
-                # This fallback will now work with the updated requirements
-                from langchain_openai import ChatOpenAI
-                openai_api_key = config['API_KEYS'].get('OPENAI_API_KEY') or config['API_KEYS'].get('OPENAI')
-                if openai_api_key:
-                    self.llm = ChatOpenAI(
-                        temperature=config['LLM_CONFIG'].get('temperature', 0.1),
-                        openai_api_key=openai_api_key
-                    )
-                    print(f"Using {config['LLM_CONFIG']['model_name']}. Be careful of the charges!")
-                else:
-                    raise ValueError("No OpenAI API key found")
-            except Exception as e2:
-                print(f"⚠️ Cannot connect to Ollama: {e}")
-                print(f"⚠️ Cannot fall back to OpenAI: {e2}")
-                print("⚠️ Running in non-LLM mode with limited functionality")
+            from langchain_openai import ChatOpenAI
 
-                # Corrected implementation of the mock LLM
+            model_name = self.config["LLM_CONFIG"]["model_name"]
+            if model_name.startswith("ollama/"):
+                model_name = model_name.split("ollama/", 1)[1]
+
+            base_url = self.config["LLM_CONFIG"]["base_url"].rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url = f"{base_url}/v1"
+
+            openai_api_key = (
+                self.config["API_KEYS"].get("OPENAI_API_KEY")
+                or self.config["API_KEYS"].get("OPENAI")
+                or os.getenv("OPENAI_API_KEY")
+                or "testapikey"
+            )
+
+            llm = ChatOpenAI(
+                model=model_name,
+                base_url=base_url,
+                openai_api_key=openai_api_key,
+                timeout=float(os.getenv("LLM_REQUEST_TIMEOUT", "120")),
+                temperature=self.config["LLM_CONFIG"].get("temperature", 0.1),
+            )
+            logger.info(f"Connected model {model_name} using {base_url}.")
+            return llm
+        except Exception as openai_error:
+            try:
+                from langchain_ollama import ChatOllama
+
+                llm = ChatOllama(
+                    model=self.config["LLM_CONFIG"]["model_name"].replace("ollama/", ""),
+                    base_url=self.config["LLM_CONFIG"]["base_url"],
+                    request_timeout=float(os.getenv("LLM_REQUEST_TIMEOUT", "120")),
+                )
+                logger.info(
+                    f"Connected fallback model {self.config['LLM_CONFIG']['model_name']} using "
+                    f"{self.config['LLM_CONFIG']['base_url']}."
+                )
+                return llm
+            except Exception as ollama_error:
+                logger.warning(
+                    "LLM connection is unavailable. The pipeline will continue without LLM-backed summaries. "
+                    f"OpenAI-compatible error: {openai_error}. Ollama error: {ollama_error}."
+                )
+
                 class SimpleMockLLM(LLM):
-                    """A very simple mock LLM implementation."""
-                    model_name: str = "fake-llm"
-                    provider: str = "fake-provider"
+                    model_name: str = "mock-llm"
+                    provider: str = "mock-provider"
 
                     def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs) -> str:
-                        return "This is a mock response for testing without an LLM."
+                        return "LLM output is not available in this environment."
 
                     @property
                     def _llm_type(self) -> str:
-                        """Return type of LLM."""
                         return "simple_mock"
 
                     @property
                     def _identifying_params(self) -> Dict[str, Any]:
                         return {"model_name": self.model_name, "provider": self.provider}
 
-                self.llm = SimpleMockLLM()
+                return SimpleMockLLM()
 
-        self.setup_crew_agents()
+    def _build_exchange_lookup(self) -> Dict[str, str]:
+        lookup: Dict[str, str] = {}
+        for market_name, config_key in (("SP500", "sp500_symbols"), ("NASDAQ", "nasdaq_symbols")):
+            for symbol in self.config["MARKET_CONFIG"].get(config_key, []):
+                lookup.setdefault(symbol.upper(), market_name)
+        return lookup
+
+    def _resolve_symbols(self, symbols: Optional[Iterable[str]] = None) -> List[str]:
+        source = symbols or self.DEFAULT_SYMBOLS
+        unique_symbols: List[str] = []
+        seen = set()
+        for symbol in source:
+            cleaned = str(symbol).strip().upper()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            unique_symbols.append(cleaned)
+        return unique_symbols
+
+    def _model_factory(self):
+        return self.ml_predictor.__class__(self.config)
+
+    def _normalize_market_frame(self, market_data: pd.DataFrame) -> pd.DataFrame:
+        if market_data.empty:
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+        rename_map = {
+            "open_price": "open",
+            "high_price": "high",
+            "low_price": "low",
+            "close_price": "close",
+        }
+        normalized = market_data.rename(columns=rename_map).copy()
+        normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], utc=True)
+        normalized = normalized.sort_values("timestamp").reset_index(drop=True)
+        return normalized[["timestamp", "open", "high", "low", "close", "volume"]]
+
+    def _next_prediction_timestamp(self, latest_timestamp, interval: str = "1h") -> pd.Timestamp:
+        latest_timestamp = pd.to_datetime(latest_timestamp, utc=True)
+        if interval.endswith("h"):
+            return latest_timestamp + timedelta(hours=int(interval[:-1] or "1"))
+        if interval.endswith("d"):
+            return latest_timestamp + timedelta(days=int(interval[:-1] or "1"))
+        raise ValueError(f"Unsupported interval: {interval}")
+
+    def _calculate_confidence(self, metadata: Dict[str, Any], current_price: float, predicted_price: float) -> float:
+        rmse = metadata.get("test_rmse") or metadata.get("train_rmse")
+        if rmse is None or current_price <= 0:
+            baseline = 55.0
+        else:
+            error_ratio = abs(float(rmse)) / max(abs(current_price), 1e-9)
+            baseline = 90.0 - min(55.0, error_ratio * 1800.0)
+
+        move_ratio = abs(predicted_price - current_price) / max(abs(current_price), 1e-9)
+        confidence = baseline - min(15.0, move_ratio * 250.0)
+        return round(max(10.0, min(95.0, confidence)), 2)
+
+    def _format_prediction_message(self, prediction: Dict[str, Any]) -> str:
+        direction = prediction["direction"]
+        return (
+            f"{prediction['symbol']} is trading at ${prediction['current_price']:.2f}. "
+            f"The next {prediction['interval']} model estimate is ${prediction['predicted_price']:.2f}, "
+            f"{direction} {abs(prediction['predicted_change_pct']):.2f}%. "
+            f"Confidence is {prediction['confidence_score']:.1f}%."
+        )
+
+    def _format_report_message(self, items: List[Dict[str, Any]], timestamp: str) -> str:
+        if not items:
+            return "No market data is available for the requested symbols."
+
+        top_mover = max(items, key=lambda item: abs(item.get("predicted_change_pct", 0.0)))
+        return (
+            f"Market summary generated at {timestamp}. "
+            f"Tracked {len(items)} symbols. "
+            f"The largest projected move is {top_mover['symbol']} at {top_mover['predicted_change_pct']:+.2f}%."
+        )
+
+    def _build_status_message(self, action: str, symbols: List[str], failures: List[Dict[str, Any]]) -> str:
+        if failures:
+            return (
+                f"{action} completed with partial results for {len(symbols)} symbols. "
+                f"{len(failures)} symbol runs need attention."
+            )
+        return f"{action} completed for {len(symbols)} symbols."
+
+    def _clean_json_value(self, value):
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        if pd.isna(value):
+            return None
+        return value
 
     def setup_crew_agents(self):
-        """Setup CrewAI agents for different tasks"""
-
-        # Data Collection Agent
+        """Keep CrewAI agents available for future use without driving the critical path."""
         self.data_agent = Agent(
-            role='Data Collection Specialist',
-            goal='Collect and validate financial market data from various sources',
-            backstory="""You are an expert in financial data collection with deep knowledge
-            of market data APIs and data quality validation. You ensure data accuracy and completeness.""",
+            role="Data Collection Specialist",
+            goal="Collect and validate financial market data from various sources",
+            backstory=(
+                "You specialize in financial market data quality and keep market records current, "
+                "complete, and consistent."
+            ),
             llm=self.llm,
-            verbose=True
+            verbose=True,
         )
-
-        # ML Training Agent
         self.ml_agent = Agent(
-            role='Machine Learning Engineer',
-            goal='Train and optimize predictive models for financial forecasting',
-            backstory="""You are a skilled ML engineer specializing in time series forecasting
-            and neural networks. You focus on model performance and accuracy.""",
+            role="Machine Learning Engineer",
+            goal="Train and evaluate time-series forecasting models",
+            backstory=(
+                "You focus on model quality, reproducibility, and clear model performance reporting."
+            ),
             llm=self.llm,
-            verbose=True
+            verbose=True,
         )
-
-        # Prediction Agent
         self.prediction_agent = Agent(
-            role='Market Prediction Analyst',
-            goal='Generate accurate market predictions and assess confidence levels',
-            backstory="""You are a financial analyst expert in market prediction and risk assessment.
-            You provide insights on market trends and prediction reliability.""",
+            role="Market Prediction Analyst",
+            goal="Summarize model outputs and risk signals",
+            backstory=(
+                "You translate short-term market model outputs into concise operational summaries."
+            ),
             llm=self.llm,
-            verbose=True
+            verbose=True,
         )
 
-        # Dashboard Agent
-        self.dashboard_agent = Agent(
-            role='Data Visualization Specialist',
-            goal='Create insightful dashboards and visualizations for market data',
-            backstory="""You are a data visualization expert who creates compelling and
-            informative dashboards for financial professionals.""",
-            llm=self.llm,
-            verbose=True
-        )
+    def collect_market_data(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        period: str = "5d",
+        interval: str = "1h",
+    ) -> Dict[str, Any]:
+        symbols = self._resolve_symbols(symbols)
+        logger.info(f"Collecting {interval} market data for {', '.join(symbols)} using period {period}.")
 
-    def create_data_collection_task(self, symbols, exchange):
-        """Create data collection task"""
-        return Task(
-            description=f"""
-            Collect hourly market data for {exchange} symbols: {symbols}
+        market_data = self.data_collector.fetch_yfinance_data(symbols, period=period, interval=interval)
+        if market_data.empty:
+            return {
+                "status": "no_data",
+                "symbols": symbols,
+                "rows_collected": 0,
+                "message": "No market data was returned by the provider.",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
 
-            Steps:
-            1. Fetch data from financial APIs
-            2. Validate data quality and completeness
-            3. Store data in PostgreSQL database
-            4. Report collection status and any issues
-
-            Success criteria:
-            - All symbols have current data
-            - No missing timestamps in the last 24 hours
-            - Data passes quality validation checks
-            """,
-            expected_output=f"""
-            A summary of collected data for {symbols} including:
-            - Number of records collected
-            - Timestamp range
-            - Data quality metrics
-            - Any issues encountered
-            """,
-            agent=self.data_agent
-        )
-
-    def create_ml_training_task(self, symbol):
-        """Create ML training task"""
-        return Task(
-            description=f"""
-            Train LSTM model for {symbol} price prediction
-
-            Steps:
-            1. Retrieve historical data from database
-            2. Prepare features and technical indicators
-            3. Train LSTM model with optimal parameters
-            4. Validate model performance
-            5. Save trained model for predictions
-
-            Success criteria:
-            - Model achieves RMSE < 5% of price range
-            - Training completes without errors
-            """,
-            expected_output=f"""
-            A training report for {symbol} model including:
-            - Model architecture details
-            - Training/validation loss curves
-            - Performance metrics (RMSE, MAE, etc.)
-            - Feature importance if available
-            - Model is saved and ready for predictions
-            """,
-            agent=self.ml_agent
-        )
-
-    def create_prediction_task(self, symbols):
-        """Create prediction task"""
-        return Task(
-            description=f"""
-            Generate price predictions for symbols: {symbols}
-
-            Steps:
-            1. Load trained models for each symbol
-            2. Fetch latest market data
-            3. Generate price predictions for next hour
-            4. Calculate confidence scores
-            5. Store predictions in database
-
-            Success criteria:
-            - Predictions generated for all symbols
-            - Confidence scores calculated
-            - Results stored in database
-            """,
-            expected_output=f"""
-            Prediction results for {symbols} including:
-            - Predicted price movements (up/down)
-            - Price targets with confidence intervals
-            - Key factors influencing predictions
-            - Recommended trading actions
-            """,
-            agent=self.prediction_agent
-        )
-
-    def create_dashboard_task(self):
-        """Create dashboard update task"""
-        return Task(
-            description="""
-            Update real-time dashboard with latest predictions
-
-            Steps:
-            1. Retrieve latest market data and predictions
-            2. Update visualization charts and metrics
-            3. Refresh dashboard display
-            4. Ensure all components are working correctly
-
-            Success criteria:
-            - Dashboard displays current data
-            - All visualizations are updated
-            - No errors in dashboard components
-            """,
-            agent=self.dashboard_agent
-        )
-
-    async def run_full_pipeline(self):
-        """Run the complete pipeline orchestration"""
-
-        # Step 1: Data Collection
-        print("🔄 Starting data collection phase...")
-
-        sp500_task = self.create_data_collection_task(
-            self.config['MARKET_CONFIG']['sp500_symbols'][:10],  # Limit for demo
-            'SP500'
-        )
-
-        nasdaq_task = self.create_data_collection_task(
-            self.config['MARKET_CONFIG']['nasdaq_symbols'][:10],  # Limit for demo
-            'NASDAQ'
-        )
-
-        # Execute data collection
-        data_crew = Crew(
-            agents=[self.data_agent],
-            tasks=[sp500_task, nasdaq_task],
-            verbose=True
-        )
-
-        data_results = data_crew.kickoff()
-        print("✅ Data collection completed")
-
-        # Step 2: Model Training (for new symbols or periodic retraining)
-        print("🔄 Starting model training phase...")
-
-        training_tasks = []
-        key_symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'TSLA']  # Focus on key symbols
-
-        for symbol in key_symbols:
-            training_tasks.append(self.create_ml_training_task(symbol))
-
-        ml_crew = Crew(
-            agents=[self.ml_agent],
-            tasks=training_tasks,
-            verbose=True
-        )
-
-        training_results = ml_crew.kickoff()
-        print("✅ Model training completed")
-
-        # Step 3: Generate Predictions
-        print("🔄 Starting prediction phase...")
-
-        prediction_task = self.create_prediction_task(key_symbols)
-
-        prediction_crew = Crew(
-            agents=[self.prediction_agent],
-            tasks=[prediction_task],
-            verbose=True
-        )
-
-        prediction_results = prediction_crew.kickoff()
-        print("✅ Predictions generated")
-
-        # Step 4: Update Dashboard
-        print("🔄 Updating dashboard...")
-
-        dashboard_task = self.create_dashboard_task()
-
-        dashboard_crew = Crew(
-            agents=[self.dashboard_agent],
-            tasks=[dashboard_task],
-            verbose=True
-        )
-
-        dashboard_results = dashboard_crew.kickoff()
-        print("✅ Dashboard updated")
-
-        return {
-            'data_collection': data_results,
-            'model_training': training_results,
-            'predictions': prediction_results,
-            'dashboard': dashboard_results,
-            'timestamp': datetime.now()
+        market_data = market_data.copy()
+        market_data["symbol"] = market_data["symbol"].astype(str).str.upper()
+        market_data["exchange"] = market_data["symbol"].map(self.exchange_lookup).fillna("US")
+        self.db_manager.insert_market_data(market_data)
+        actuals_updated = self.db_manager.sync_prediction_actuals(symbols)
+        rows_by_symbol = {
+            symbol: int(count) for symbol, count in market_data.groupby("symbol").size().to_dict().items()
         }
 
-    def run_hourly_update(self):
-        """Run hourly prediction updates"""
-        print("🔄 Running hourly update...")
-
-        # Quick data refresh and prediction update
-        key_symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'TSLA']
-
-        # Collect latest data
-        self.data_collector.execute_collection_task(
-            f"Collect latest hourly data for symbols: {key_symbols}"
+        message = (
+            f"Collected {len(market_data)} rows across {len(rows_by_symbol)} symbols. "
+            f"Updated {actuals_updated} prediction records with realized prices."
         )
+        return {
+            "status": "ok",
+            "symbols": symbols,
+            "period": period,
+            "interval": interval,
+            "rows_collected": int(len(market_data)),
+            "rows_by_symbol": rows_by_symbol,
+            "actuals_updated": int(actuals_updated),
+            "message": message,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
 
-        # Generate predictions
-        prediction_task = self.create_prediction_task(key_symbols)
-        prediction_crew = Crew(
-            agents=[self.prediction_agent],
-            tasks=[prediction_task],
-            verbose=True
+    def train_model(
+        self,
+        symbol: str,
+        history_period: str = "6mo",
+        interval: str = "1h",
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        symbol = symbol.upper()
+        min_rows = self.ml_predictor.sequence_length + 24
+        history_limit = max(int(self.config["MARKET_CONFIG"].get("lookback_days", 365)) * 24, min_rows * 2)
+        market_data = self.db_manager.get_latest_data(symbol, limit_rows=history_limit, ascending=True)
+
+        if force_refresh or market_data.empty or len(market_data) < min_rows:
+            self.collect_market_data([symbol], period=history_period, interval=interval)
+            market_data = self.db_manager.get_latest_data(symbol, limit_rows=history_limit, ascending=True)
+
+        if market_data.empty or len(market_data) < min_rows:
+            raise ValueError(f"Not enough market history is available to train {symbol}.")
+
+        predictor = self._model_factory()
+        training_frame = self._normalize_market_frame(market_data)
+        metrics = predictor.train(training_frame, symbol)
+        message = (
+            f"Trained the {symbol} model on {metrics['training_rows']} hourly rows. "
+            f"Test RMSE is {metrics['test_rmse']:.4f}."
         )
+        logger.info(message)
+        return {
+            "symbol": symbol,
+            "training_rows": metrics["training_rows"],
+            "train_rmse": metrics["train_rmse"],
+            "test_rmse": metrics["test_rmse"],
+            "train_mae": metrics["train_mae"],
+            "test_mae": metrics["test_mae"],
+            "model_version": metrics["model_version"],
+            "trained_at": metrics["trained_at"],
+            "message": message,
+        }
 
-        results = prediction_crew.kickoff()
+    def train_models(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        history_period: str = "6mo",
+        interval: str = "1h",
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        symbols = self._resolve_symbols(symbols)
+        completed: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        for symbol in symbols:
+            try:
+                completed.append(
+                    self.train_model(
+                        symbol,
+                        history_period=history_period,
+                        interval=interval,
+                        force_refresh=force_refresh,
+                    )
+                )
+            except Exception as exc:
+                failed.append({"symbol": symbol, "error": str(exc)})
+                logger.error(f"Training failed for {symbol}: {exc}")
 
-        # Update dashboard
-        dashboard_task = self.create_dashboard_task()
-        dashboard_crew = Crew(
-            agents=[self.dashboard_agent],
-            tasks=[dashboard_task],
-            verbose=True
+        return {
+            "symbols": symbols,
+            "completed": completed,
+            "failed": failed,
+            "message": self._build_status_message("Model training", symbols, failed),
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    def generate_prediction(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        refresh_period: str = "5d",
+        force_refresh: bool = False,
+        auto_train: bool = True,
+    ) -> Dict[str, Any]:
+        symbol = symbol.upper()
+        recent_limit = max(self.ml_predictor.sequence_length + 50, 200)
+
+        if force_refresh:
+            self.collect_market_data([symbol], period=refresh_period, interval=interval)
+
+        market_data = self.db_manager.get_latest_data(symbol, limit_rows=recent_limit, ascending=True)
+        if market_data.empty or len(market_data) < self.ml_predictor.sequence_length + 5:
+            self.collect_market_data([symbol], period=refresh_period, interval=interval)
+            market_data = self.db_manager.get_latest_data(symbol, limit_rows=recent_limit, ascending=True)
+
+        if market_data.empty:
+            raise ValueError(f"No market data is available for {symbol}.")
+
+        model_path = Path(f"models/saved/{symbol}/lstm_model.h5")
+        if not model_path.exists():
+            if not auto_train:
+                raise FileNotFoundError(f"No trained model is available for {symbol}.")
+            self.train_model(symbol, history_period="6mo", interval=interval, force_refresh=False)
+
+        predictor = self._model_factory()
+        predictor.load_model(symbol)
+        metadata = predictor.load_metadata(symbol)
+        recent_frame = self._normalize_market_frame(market_data)
+
+        current_price = float(recent_frame["close"].iloc[-1])
+        predicted_price = float(predictor.predict(recent_frame))
+        predicted_change_pct = ((predicted_price - current_price) / current_price) * 100 if current_price else 0.0
+        prediction_timestamp = self._next_prediction_timestamp(recent_frame["timestamp"].iloc[-1], interval)
+        confidence_score = self._calculate_confidence(metadata, current_price, predicted_price)
+        direction = "up" if predicted_price > current_price else "down" if predicted_price < current_price else "flat"
+        model_version = metadata.get("model_version", "lstm")
+
+        record = {
+            "symbol": symbol,
+            "prediction_timestamp": prediction_timestamp,
+            "predicted_price": predicted_price,
+            "confidence_score": confidence_score,
+            "model_version": model_version,
+        }
+        self.db_manager.upsert_prediction_results([record])
+        self.db_manager.sync_prediction_actuals([symbol])
+
+        response = {
+            "symbol": symbol,
+            "interval": interval,
+            "prediction_timestamp": prediction_timestamp.isoformat(),
+            "current_price": current_price,
+            "predicted_price": predicted_price,
+            "predicted_change_pct": round(predicted_change_pct, 4),
+            "direction": direction,
+            "confidence_score": confidence_score,
+            "model_version": model_version,
+        }
+        response["message"] = self._format_prediction_message(response)
+        logger.info(response["message"])
+        return response
+
+    def generate_predictions(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        interval: str = "1h",
+        refresh_period: str = "5d",
+        force_refresh: bool = False,
+        auto_train: bool = True,
+    ) -> Dict[str, Any]:
+        symbols = self._resolve_symbols(symbols)
+        completed: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        for symbol in symbols:
+            try:
+                completed.append(
+                    self.generate_prediction(
+                        symbol,
+                        interval=interval,
+                        refresh_period=refresh_period,
+                        force_refresh=force_refresh,
+                        auto_train=auto_train,
+                    )
+                )
+            except Exception as exc:
+                failed.append({"symbol": symbol, "error": str(exc)})
+                logger.error(f"Prediction failed for {symbol}: {exc}")
+
+        return {
+            "symbols": symbols,
+            "completed": completed,
+            "failed": failed,
+            "message": self._build_status_message("Prediction generation", symbols, failed),
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    def get_latest_predictions(self, symbol: str, limit_rows: int = 24) -> Dict[str, Any]:
+        symbol = symbol.upper()
+        predictions = self.db_manager.get_latest_predictions(symbol, limit_rows=limit_rows, ascending=False)
+        if predictions.empty:
+            return {
+                "symbol": symbol,
+                "predictions": [],
+                "message": f"No prediction history is available for {symbol}.",
+            }
+
+        rows = []
+        for record in predictions.to_dict(orient="records"):
+            cleaned = {key: self._clean_json_value(value) for key, value in record.items()}
+            cleaned["prediction_timestamp"] = pd.to_datetime(cleaned["prediction_timestamp"], utc=True).isoformat()
+            if cleaned.get("created_at") is not None:
+                cleaned["created_at"] = pd.to_datetime(cleaned["created_at"], utc=True).isoformat()
+            rows.append(cleaned)
+        return {
+            "symbol": symbol,
+            "predictions": rows,
+            "message": f"Retrieved {len(rows)} prediction rows for {symbol}.",
+        }
+
+    def build_market_report(self, symbols: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        symbols = self._resolve_symbols(symbols)
+        items: List[Dict[str, Any]] = []
+
+        for symbol in symbols:
+            market_data = self.db_manager.get_latest_data(symbol, limit_rows=48, ascending=True)
+            if market_data.empty:
+                continue
+
+            recent_frame = self._normalize_market_frame(market_data)
+            latest_predictions = self.db_manager.get_latest_predictions(symbol, limit_rows=1, ascending=False)
+            current_price = float(recent_frame["close"].iloc[-1])
+            price_change_24h = 0.0
+            if len(recent_frame) > 1 and recent_frame["close"].iloc[0] != 0:
+                price_change_24h = ((current_price - float(recent_frame["close"].iloc[0])) / float(recent_frame["close"].iloc[0])) * 100
+
+            item = {
+                "symbol": symbol,
+                "current_price": current_price,
+                "price_change_24h": round(price_change_24h, 4),
+                "avg_volume_24h": float(recent_frame["volume"].tail(24).mean()),
+            }
+
+            if not latest_predictions.empty:
+                latest_prediction = latest_predictions.iloc[0]
+                item.update(
+                    {
+                        "prediction_timestamp": pd.to_datetime(
+                            latest_prediction["prediction_timestamp"], utc=True
+                        ).isoformat(),
+                        "predicted_price": float(latest_prediction["predicted_price"]),
+                        "confidence_score": float(latest_prediction["confidence_score"]),
+                        "predicted_change_pct": round(
+                            ((float(latest_prediction["predicted_price"]) - current_price) / current_price) * 100
+                            if current_price
+                            else 0.0,
+                            4,
+                        ),
+                    }
+                )
+                item["message"] = (
+                    f"{symbol} closed the latest hour at ${current_price:.2f}. "
+                    f"The most recent model estimate is ${item['predicted_price']:.2f} "
+                    f"with {item['confidence_score']:.1f}% confidence."
+                )
+            else:
+                item["predicted_price"] = None
+                item["confidence_score"] = None
+                item["predicted_change_pct"] = 0.0
+                item["message"] = (
+                    f"{symbol} closed the latest hour at ${current_price:.2f}. "
+                    "No model estimate is stored yet."
+                )
+            items.append(item)
+
+        generated_at = datetime.utcnow().isoformat()
+        return {
+            "generated_at": generated_at,
+            "symbols": symbols,
+            "items": items,
+            "message": self._format_report_message(items, generated_at),
+        }
+
+    async def run_full_pipeline(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        history_period: str = "6mo",
+        interval: str = "1h",
+    ) -> Dict[str, Any]:
+        symbols = self._resolve_symbols(symbols)
+        logger.info(f"Starting full pipeline for {', '.join(symbols)}.")
+
+        collection = self.collect_market_data(symbols, period=history_period, interval=interval)
+        training = self.train_models(symbols, history_period=history_period, interval=interval, force_refresh=False)
+        predictions = self.generate_predictions(
+            symbols,
+            interval=interval,
+            refresh_period="5d",
+            force_refresh=False,
+            auto_train=False,
         )
+        report = self.build_market_report(symbols)
 
-        dashboard_crew.kickoff()
+        return {
+            "symbols": symbols,
+            "data_collection": collection,
+            "model_training": training,
+            "predictions": predictions,
+            "report": report,
+            "timestamp": datetime.utcnow().isoformat(),
+            "message": "The full market pipeline completed.",
+        }
 
-        print("✅ Hourly update completed")
-        return results
+    def run_hourly_update(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        refresh_period: str = "5d",
+        interval: str = "1h",
+    ) -> Dict[str, Any]:
+        symbols = self._resolve_symbols(symbols)
+        logger.info(f"Running hourly update for {', '.join(symbols)}.")
+
+        collection = self.collect_market_data(symbols, period=refresh_period, interval=interval)
+        predictions = self.generate_predictions(
+            symbols,
+            interval=interval,
+            refresh_period=refresh_period,
+            force_refresh=False,
+            auto_train=True,
+        )
+        report = self.build_market_report(symbols)
+
+        return {
+            "symbols": symbols,
+            "data_collection": collection,
+            "predictions": predictions,
+            "report": report,
+            "timestamp": datetime.utcnow().isoformat(),
+            "message": "The hourly market update completed.",
+        }
 
     def schedule_operations(self):
-        """Schedule regular operations"""
+        """Schedule regular operations."""
         import schedule
         import time
 
-        # Schedule hourly updates
         schedule.every().hour.do(self.run_hourly_update)
-
-        # Schedule daily full pipeline (for retraining)
         schedule.every().day.at("02:00").do(lambda: asyncio.run(self.run_full_pipeline()))
 
-        print("📅 Scheduler started. Running continuous operations...")
-
+        logger.info("Scheduler started. Waiting for the next market update window.")
         while True:
             schedule.run_pending()
-            time.sleep(60)  # Check every minute
+            time.sleep(60)

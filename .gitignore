@@ -5,7 +5,9 @@ wrds_*
 # Environment variables
 .env
 .env.local
+.env.*
 .env.*.local
+!.env.example
 
 # Python
 __pycache__/

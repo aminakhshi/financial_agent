@@ -53,7 +53,7 @@ class DataCollectorAgent:
             #     model=config['LLM_CONFIG']['model_name'],
             #     base_url=config['LLM_CONFIG']['base_url']
             # )
-            print(f"Data collector agent using: {config['LLM_CONFIG']['model_name']}")
+            print(f"Data collector is using model {config['LLM_CONFIG']['model_name']}.")
         except Exception as e:
             try:
                 # fallback to using OpenAI
@@ -64,10 +64,13 @@ class DataCollectorAgent:
                         temperature=config['LLM_CONFIG'].get('temperature', 0.1),
                         openai_api_key=openai_api_key
                     )
-                    print(f"Data collector agent using is {config['LLM_CONFIG']['model_name']}. Be careful of the charges!")
+                    print(
+                        f"Data collector is using the OpenAI-compatible model "
+                        f"{config['LLM_CONFIG']['model_name']}."
+                    )
             except Exception as e2:
-                print(f"⚠️ Cannot connect data collector agent")
-                print("⚠ Running in non-LLM mode with limited functionality")
+                print("Data collector could not connect to the configured LLM backend.")
+                print("Running in non-LLM mode with limited functionality.")
 
             # Create a custom LLM that will work with litellm
             from typing import Optional, List, Dict, Any

@@ -13,9 +13,11 @@ This pipeline uses LLM agents to collect financial market data, train DNN models
 ## Quick Start
 
 1. Clone the repository
-2. Set up your environment variables in `.env`
-3. Start with Docker: `docker-compose up -d`
-4. Access the dashboard: http://localhost:8501
+2. Copy `.env.example` to a local env file such as `.env` or `.env.docker-test`
+3. Keep local env files out of source control. The repo is configured to ignore `.env*` files except `.env.example`.
+4. Start with Docker: `docker-compose up -d`
+5. Access the dashboard: http://localhost:8501
+6. Access the API docs: http://localhost:8000/docs
 
 ## Prerequisites
 
@@ -28,3 +30,16 @@ This pipeline uses LLM agents to collect financial market data, train DNN models
 ## Documentation
 
 See the implementation guide for detailed setup and usage instructions.
+
+## API Services
+
+The project now includes a FastAPI service for external automation and assistant integrations.
+
+- Start locally: `uvicorn api.app:app --host 0.0.0.0 --port 8000`
+- Health check: `GET /health`
+- Collect market data: `POST /market-data/collect`
+- Train models: `POST /models/train`
+- Generate predictions: `POST /predictions/generate`
+- Get latest predictions: `GET /predictions/latest?symbol=AAPL`
+- Build a market report: `GET /reports/market-summary`
+- Read recent logs: `GET /logs/recent`

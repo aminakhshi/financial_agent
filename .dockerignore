@@ -2,7 +2,9 @@
 .gitignore
 .env
 .env.local
+.env.*
 .env.*.local
+!.env.example
 logs/
 *.log
 *.db

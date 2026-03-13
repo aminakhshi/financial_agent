@@ -29,22 +29,13 @@ class FinancialDashboard:
         """
         Loads the latest market data and predictions for a given stock symbol.
         """
-        market_data = self.db_manager.get_latest_data(symbol, limit_rows=hours)
+        market_data = self.db_manager.get_latest_data(symbol, limit_rows=hours, ascending=True)
 
         predictions = pd.DataFrame()  # Empty dataframe for predictions
         
         # Fetch predictions separately if use_predictions
         if use_predictions:
-            with self.db_manager.Session() as session:
-                predictions_query = session.query(
-                    self.db_manager.PredictionResults
-                ).filter(
-                    self.db_manager.PredictionResults.symbol == symbol
-                ).order_by(
-                    self.db_manager.PredictionResults.prediction_timestamp.desc()
-                ).limit(pred_limit)  # Get the predictions
-                
-                predictions = pd.read_sql(predictions_query.statement, self.db_manager.engine)
+            predictions = self.db_manager.get_latest_predictions(symbol, limit_rows=pred_limit, ascending=True)
                 
         return market_data, predictions
 
@@ -189,7 +180,7 @@ def main():
     col1.metric("Current Price", f"${metrics['current_price']:.2f}", price_delta)
     col2.metric("Avg. Volume (24h)", f"{metrics['avg_volume']/1_000_000:.2f}M")
     col3.metric("Prediction Accuracy", f"{metrics['prediction_accuracy']:.2f}%")
-    latest_pred = predictions['predicted_price'].iloc[0] if not predictions.empty else 0
+    latest_pred = predictions['predicted_price'].iloc[-1] if not predictions.empty else 0
     col4.metric("Latest Prediction", f"${latest_pred:.2f}")
 
     # Charts
@@ -209,4 +200,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

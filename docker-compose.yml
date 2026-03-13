@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${DB_HOST_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -19,7 +19,7 @@ services:
     image: redis:7-alpine
     command: redis-server --requirepass ${REDIS_PASSWORD}
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     networks:
       - financial_net
 
@@ -27,24 +27,23 @@ services:
   ollama:
     image: ollama/ollama:latest
     ports:
-      - "127.0.0.1:11434:11434"
+      - "127.0.0.1:${OLLAMA_HOST_PORT:-11434}:11434"
     volumes:
       - ollama_data:/root/.ollama
     networks:
       - financial_net
-    command: >
-      sh -c "ollama serve &
-             sleep 10 &&
-             ollama pull ${OLLAMA_MODEL:-deepseek-r1:32b} &&
-             wait"
+    command: ["serve"]
 
   # Main application
   financial_app:
     build: .
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     depends_on:
       - postgres
       - redis
       - ollama
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - DB_HOST=postgres
       - DB_PORT=5432
@@ -54,16 +53,59 @@ services:
       - DB_PASSWORD=${DB_PASSWORD}
       - REDIS_PASSWORD=${REDIS_PASSWORD}
       - ENABLE_SQLITE_FALLBACK=${ENABLE_SQLITE_FALLBACK:-false}
+      - DISABLE_CREWAI=${DISABLE_CREWAI:-false}
       - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
       - LLM_BASE_URL=${LLM_BASE_URL:-http://ollama:11434}
       - LLM_MODEL_NAME=${LLM_MODEL_NAME:-deepseek-r1:32b}
       - LLM_REQUEST_TIMEOUT=${LLM_REQUEST_TIMEOUT:-120}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-testapikey}
+      - HOME=/tmp
+      - XDG_DATA_HOME=/tmp/.local/share
       - API_KEY_ALPHAVANTAGE=${API_KEY_ALPHAVANTAGE}
       - API_KEY_FINANCIALMODELINGPREP=${API_KEY_FINANCIALMODELINGPREP}
       - API_KEY_NEWS=${API_KEY_NEWS}
       - API_KEY_POLYGON=${API_KEY_POLYGON}
     ports:
-      - "127.0.0.1:8501:8501"  # Streamlit dashboard
+      - "127.0.0.1:${APP_HOST_PORT:-8501}:8501"  # Streamlit dashboard
+    volumes:
+      - ./src:/app/src
+      - ./models:/app/models
+      - ./logs:/app/logs
+    networks:
+      - financial_net
+
+  financial_api:
+    build: .
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    depends_on:
+      - postgres
+      - redis
+      - ollama
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-financial_data}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - ENABLE_SQLITE_FALLBACK=${ENABLE_SQLITE_FALLBACK:-false}
+      - DISABLE_CREWAI=${DISABLE_CREWAI:-false}
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://ollama:11434}
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-deepseek-r1:32b}
+      - LLM_REQUEST_TIMEOUT=${LLM_REQUEST_TIMEOUT:-120}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-testapikey}
+      - HOME=/tmp
+      - XDG_DATA_HOME=/tmp/.local/share
+      - API_KEY_ALPHAVANTAGE=${API_KEY_ALPHAVANTAGE}
+      - API_KEY_FINANCIALMODELINGPREP=${API_KEY_FINANCIALMODELINGPREP}
+      - API_KEY_NEWS=${API_KEY_NEWS}
+      - API_KEY_POLYGON=${API_KEY_POLYGON}
+    command: ["uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     volumes:
       - ./src:/app/src
       - ./models:/app/models
