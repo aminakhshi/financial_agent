@@ -23,6 +23,30 @@ type RequestInitLike = {
   overrides?: RequestOverrides;
 };
 
+function parseResponseBody(rawText: string): unknown {
+  if (!rawText) {
+    return {};
+  }
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    return rawText;
+  }
+}
+
+function resolveErrorDetail(
+  response: Response,
+  payload: unknown,
+): string {
+  if (payload && typeof payload === "object" && "detail" in payload) {
+    return String((payload as { detail: unknown }).detail);
+  }
+  if (typeof payload === "string" && payload.trim()) {
+    return payload.trim();
+  }
+  return `${response.status} ${response.statusText}`;
+}
+
 async function requestJson<T>(
   api: OpenClawPluginApi,
   params: RequestInitLike,
@@ -50,13 +74,9 @@ async function requestJson<T>(
     });
 
     const rawText = await response.text();
-    const payload = rawText ? JSON.parse(rawText) : {};
+    const payload = parseResponseBody(rawText);
     if (!response.ok) {
-      const detail =
-        payload && typeof payload === "object" && "detail" in payload
-          ? String((payload as { detail: unknown }).detail)
-          : `${response.status} ${response.statusText}`;
-      throw new Error(`Market API request failed: ${detail}`);
+      throw new Error(`Market API request failed: ${resolveErrorDetail(response, payload)}`);
     }
     return payload as T;
   } catch (error) {
@@ -186,13 +206,9 @@ export async function getMarketReportDirect(
   try {
     const response = await fetch(url, { signal: controller.signal });
     const rawText = await response.text();
-    const payload = rawText ? JSON.parse(rawText) : {};
+    const payload = parseResponseBody(rawText);
     if (!response.ok) {
-      const detail =
-        payload && typeof payload === "object" && "detail" in payload
-          ? String((payload as { detail: unknown }).detail)
-          : `${response.status} ${response.statusText}`;
-      throw new Error(`Market API request failed: ${detail}`);
+      throw new Error(`Market API request failed: ${resolveErrorDetail(response, payload)}`);
     }
     return payload as MarketReportResponse;
   } finally {
