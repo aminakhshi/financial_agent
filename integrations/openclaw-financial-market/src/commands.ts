@@ -27,7 +27,7 @@ import {
   formatReport,
   formatTraining,
 } from "./format.js";
-import { formatJsonText, textReply } from "./shared.js";
+import { formatJsonText, mergePredictionsIntoReport, textReply } from "./shared.js";
 
 async function buildReportCommandResponse(api: OpenClawPluginApi, argsText: string) {
   const { flags } = parseCommandArgs(argsText);
@@ -38,6 +38,7 @@ async function buildReportCommandResponse(api: OpenClawPluginApi, argsText: stri
   const interval = resolveCommandInterval(api, flags);
   const refresh = shouldRefreshReport(api, flags);
   const train = shouldTrain(flags);
+  let predictionResponse;
 
   if (refresh) {
     await collectMarketData(api, {
@@ -57,22 +58,21 @@ async function buildReportCommandResponse(api: OpenClawPluginApi, argsText: stri
     });
   }
 
-  if (refresh || train) {
-    await generatePredictions(api, {
-      symbols,
-      interval,
-      refreshPeriod: period,
-      forceRefresh: false,
-      autoTrain: true,
-      overrides,
-    });
-  }
+  predictionResponse = await generatePredictions(api, {
+    symbols,
+    interval,
+    refreshPeriod: period,
+    forceRefresh: false,
+    autoTrain: true,
+    overrides,
+  });
 
   const report = await getMarketReportDirect(api, {
     symbols,
     overrides,
   });
-  return shouldJson(flags) ? formatJsonText(report) : formatReport(report);
+  const mergedReport = mergePredictionsIntoReport(report, predictionResponse);
+  return shouldJson(flags) ? formatJsonText(mergedReport) : formatReport(mergedReport);
 }
 
 async function buildRunCommandResponse(api: OpenClawPluginApi, argsText: string) {

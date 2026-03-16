@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { Command } from "commander";
 import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { getHealth, getLogs, getMarketReportDirect } from "./client.js";
+import { generatePredictions, getHealth, getLogs, getMarketReportDirect } from "./client.js";
 import {
   runCollectForCli,
   runPredictForCli,
@@ -10,6 +10,7 @@ import {
 import { formatHealth, formatLogs, formatReport } from "./format.js";
 import {
   formatJsonText,
+  mergePredictionsIntoReport,
   resolveDefaultInterval,
   resolveDefaultPeriod,
   resolvePluginConfig,
@@ -329,6 +330,7 @@ export function registerFinancialMarketCli(api: OpenClawPluginApi, ctx: CliConte
         const overrides = resolveCliOverrides(options);
         const refresh = options.refresh === true;
         const train = options.train === true;
+        let predictionResponse;
 
         if (refresh) {
           await runCollectForCli(api, {
@@ -350,18 +352,17 @@ export function registerFinancialMarketCli(api: OpenClawPluginApi, ctx: CliConte
           });
         }
 
-        if (refresh || train) {
-          await runPredictForCli(api, {
-            symbols,
-            period,
-            interval,
-            overrides,
-            json: false,
-          });
-        }
+        predictionResponse = await generatePredictions(api, {
+          symbols,
+          refreshPeriod: period,
+          interval,
+          overrides,
+          autoTrain: true,
+        });
 
         const response = await getMarketReportDirect(api, { symbols, overrides });
-        renderAndPrint(options.json ? formatJsonText(response) : formatReport(response));
+        const mergedReport = mergePredictionsIntoReport(response, predictionResponse);
+        renderAndPrint(options.json ? formatJsonText(mergedReport) : formatReport(mergedReport));
       },
     );
 

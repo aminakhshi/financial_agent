@@ -1,6 +1,7 @@
 import asyncio
 import os
 from datetime import datetime, timedelta
+from math import sqrt
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -124,6 +125,40 @@ class AutomationAgent:
             unique_symbols.append(cleaned)
         return unique_symbols
 
+    def _resolve_market_universe(
+        self,
+        universe: str = "default",
+        symbols: Optional[Iterable[str]] = None,
+    ) -> List[str]:
+        if symbols:
+            resolved = self._resolve_symbols(symbols)
+            if resolved:
+                return resolved
+
+        normalized_universe = (universe or "default").strip().lower()
+        configured_sp500 = self.config["MARKET_CONFIG"].get("sp500_symbols", [])
+        configured_nasdaq = self.config["MARKET_CONFIG"].get("nasdaq_symbols", [])
+        universe_map = {
+            "default": self.default_symbols,
+            "watchlist": self.default_symbols,
+            "sp500": configured_sp500,
+            "s&p500": configured_sp500,
+            "nasdaq": configured_nasdaq,
+            "all": configured_sp500 + configured_nasdaq,
+            "configured": configured_sp500 + configured_nasdaq,
+            "configured_all": configured_sp500 + configured_nasdaq,
+        }
+
+        if normalized_universe not in universe_map:
+            raise ValueError(
+                "Unsupported universe. Use one of: default, sp500, nasdaq, all, configured."
+            )
+
+        resolved = self._resolve_symbols(universe_map[normalized_universe])
+        if not resolved:
+            raise ValueError(f"No symbols are configured for universe '{normalized_universe}'.")
+        return resolved
+
     def _model_factory(self):
         return self.ml_predictor.__class__(self.config)
 
@@ -196,6 +231,66 @@ class AutomationAgent:
         if pd.isna(value):
             return None
         return value
+
+    def _serialize_market_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        serialized = {key: self._clean_json_value(value) for key, value in row.items()}
+        if serialized.get("timestamp") is not None:
+            serialized["timestamp"] = pd.to_datetime(serialized["timestamp"], utc=True).isoformat()
+        if serialized.get("created_at") is not None:
+            serialized["created_at"] = pd.to_datetime(serialized["created_at"], utc=True).isoformat()
+        return serialized
+
+    def _serialize_prediction_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        serialized = {key: self._clean_json_value(value) for key, value in row.items()}
+        if serialized.get("prediction_timestamp") is not None:
+            serialized["prediction_timestamp"] = pd.to_datetime(
+                serialized["prediction_timestamp"],
+                utc=True,
+            ).isoformat()
+        if serialized.get("created_at") is not None:
+            serialized["created_at"] = pd.to_datetime(serialized["created_at"], utc=True).isoformat()
+        return serialized
+
+    def _summarize_prediction_metrics(self, evaluated: pd.DataFrame) -> Dict[str, Optional[float]]:
+        if evaluated.empty:
+            return {
+                "mae": None,
+                "rmse": None,
+                "mape": None,
+                "accuracy_pct": None,
+            }
+
+        absolute_percentage_error = evaluated["absolute_percentage_error"].dropna()
+        mape = float(absolute_percentage_error.mean()) if not absolute_percentage_error.empty else None
+        accuracy_pct = None if mape is None else max(0.0, 100.0 - mape)
+        return {
+            "mae": round(float(evaluated["absolute_error"].mean()), 6),
+            "rmse": round(float(sqrt((evaluated["error"] ** 2).mean())), 6),
+            "mape": None if mape is None else round(mape, 6),
+            "accuracy_pct": None if accuracy_pct is None else round(accuracy_pct, 6),
+        }
+
+    def _serialize_prediction_for_report(self, prediction: Dict[str, Any], current_price: float) -> Dict[str, Any]:
+        predicted_change_pct = prediction.get("predicted_change_pct")
+        if predicted_change_pct is None:
+            predicted_price = float(prediction["predicted_price"])
+            predicted_change_pct = ((predicted_price - current_price) / current_price) * 100 if current_price else 0.0
+
+        return {
+            "prediction_timestamp": pd.to_datetime(prediction["prediction_timestamp"], utc=True).isoformat(),
+            "predicted_price": float(prediction["predicted_price"]),
+            "confidence_score": float(prediction["confidence_score"]),
+            "predicted_change_pct": round(float(predicted_change_pct), 4),
+        }
+
+    def _prediction_is_fresh(
+        self,
+        prediction_timestamp: Any,
+        latest_market_timestamp: Any,
+    ) -> bool:
+        prediction_ts = pd.to_datetime(prediction_timestamp, utc=True)
+        market_ts = pd.to_datetime(latest_market_timestamp, utc=True)
+        return prediction_ts > market_ts
 
     def setup_crew_agents(self):
         """Keep CrewAI agents available for future use without driving the critical path."""
@@ -271,6 +366,25 @@ class AutomationAgent:
             "message": message,
             "timestamp": datetime.utcnow().isoformat(),
         }
+
+    def collect_market_universe(
+        self,
+        universe: str = "all",
+        period: str = "1mo",
+        interval: str = "1h",
+        symbols: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        resolved_symbols = self._resolve_market_universe(universe=universe, symbols=symbols)
+        result = self.collect_market_data(resolved_symbols, period=period, interval=interval)
+        result["universe"] = (universe or "custom").strip().lower()
+        result["requested_symbol_count"] = len(resolved_symbols)
+        result["stored_symbol_count"] = len(result.get("rows_by_symbol", {}))
+        result["message"] = (
+            f"Collected {result['rows_collected']} rows for {result['stored_symbol_count']} of "
+            f"{len(resolved_symbols)} configured symbols in the {result['universe']} universe. "
+            f"Updated {result['actuals_updated']} prediction records with realized prices."
+        )
+        return result
 
     def train_model(
         self,
@@ -466,17 +580,213 @@ class AutomationAgent:
             "message": f"Retrieved {len(rows)} prediction rows for {symbol}.",
         }
 
-    def build_market_report(self, symbols: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+    def get_market_history(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        universe: str = "configured",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        exchange: Optional[str] = None,
+        limit_rows: int = 1000,
+        ascending: bool = False,
+    ) -> Dict[str, Any]:
+        normalized_universe = (universe or "").strip().lower()
+        resolved_symbols = None
+        if symbols or normalized_universe not in {"", "database", "stored"}:
+            resolved_symbols = self._resolve_market_universe(universe=universe, symbols=symbols)
+        market_history = self.db_manager.get_market_history(
+            symbols=resolved_symbols,
+            start=start,
+            end=end,
+            exchange=exchange,
+            limit_rows=limit_rows,
+            ascending=ascending,
+        )
+
+        rows = [self._serialize_market_row(row) for row in market_history.to_dict(orient="records")]
+        available_symbols = (
+            sorted({str(symbol).upper() for symbol in market_history["symbol"].tolist()})
+            if not market_history.empty
+            else (resolved_symbols or [])
+        )
+        return {
+            "symbols": available_symbols,
+            "universe": None if symbols else (universe or None),
+            "row_count": len(rows),
+            "rows": rows,
+            "message": f"Retrieved {len(rows)} market history rows from SQL storage.",
+        }
+
+    def evaluate_predictions(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        universe: str = "configured",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        limit_rows: int = 1000,
+        sync_actuals: bool = True,
+    ) -> Dict[str, Any]:
+        normalized_universe = (universe or "").strip().lower()
+        resolved_symbols = None
+        if symbols or normalized_universe not in {"", "database", "stored"}:
+            resolved_symbols = self._resolve_market_universe(universe=universe, symbols=symbols)
+        if sync_actuals:
+            self.db_manager.sync_prediction_actuals(resolved_symbols)
+
+        prediction_history = self.db_manager.get_prediction_history(
+            symbols=resolved_symbols,
+            start=start,
+            end=end,
+            limit_rows=limit_rows,
+            ascending=False,
+            only_evaluated=False,
+        )
+
+        if prediction_history.empty:
+            return {
+                "symbols": resolved_symbols or [],
+                "universe": None if symbols else (universe or None),
+                "prediction_count": 0,
+                "evaluated_count": 0,
+                "pending_actual_count": 0,
+                "metrics": self._summarize_prediction_metrics(pd.DataFrame()),
+                "by_symbol": [],
+                "rows": [],
+                "message": "No prediction history is available for evaluation.",
+            }
+
+        evaluated = prediction_history.dropna(subset=["actual_price"]).copy()
+        if not evaluated.empty:
+            evaluated["error"] = evaluated["predicted_price"] - evaluated["actual_price"]
+            evaluated["absolute_error"] = evaluated["error"].abs()
+            actual_denominator = evaluated["actual_price"].abs().replace(0, pd.NA)
+            evaluated["absolute_percentage_error"] = (
+                evaluated["absolute_error"] / actual_denominator
+            ) * 100.0
+
+        metrics = self._summarize_prediction_metrics(evaluated)
+        rows = []
+        for row in prediction_history.to_dict(orient="records"):
+            serialized = self._serialize_prediction_row(row)
+            if serialized.get("actual_price") is not None:
+                error = float(serialized["predicted_price"]) - float(serialized["actual_price"])
+                serialized["error"] = round(error, 6)
+                serialized["absolute_error"] = round(abs(error), 6)
+                if float(serialized["actual_price"]) != 0:
+                    serialized["absolute_percentage_error"] = round(
+                        abs(error) / abs(float(serialized["actual_price"])) * 100.0,
+                        6,
+                    )
+                else:
+                    serialized["absolute_percentage_error"] = None
+            else:
+                serialized["error"] = None
+                serialized["absolute_error"] = None
+                serialized["absolute_percentage_error"] = None
+            rows.append(serialized)
+
+        by_symbol = []
+        for symbol, group in prediction_history.groupby("symbol"):
+            group_evaluated = group.dropna(subset=["actual_price"]).copy()
+            if not group_evaluated.empty:
+                group_evaluated["error"] = group_evaluated["predicted_price"] - group_evaluated["actual_price"]
+                group_evaluated["absolute_error"] = group_evaluated["error"].abs()
+                group_denominator = group_evaluated["actual_price"].abs().replace(0, pd.NA)
+                group_evaluated["absolute_percentage_error"] = (
+                    group_evaluated["absolute_error"] / group_denominator
+                ) * 100.0
+            symbol_metrics = self._summarize_prediction_metrics(group_evaluated)
+            by_symbol.append(
+                {
+                    "symbol": symbol,
+                    "prediction_count": int(len(group)),
+                    "evaluated_count": int(len(group_evaluated)),
+                    "pending_actual_count": int(len(group) - len(group_evaluated)),
+                    **symbol_metrics,
+                }
+            )
+
+        pending_count = int(len(prediction_history) - len(evaluated))
+        return {
+            "symbols": sorted({str(symbol).upper() for symbol in prediction_history["symbol"].tolist()}),
+            "universe": None if symbols else (universe or None),
+            "prediction_count": int(len(prediction_history)),
+            "evaluated_count": int(len(evaluated)),
+            "pending_actual_count": pending_count,
+            "metrics": metrics,
+            "by_symbol": by_symbol,
+            "rows": rows,
+            "message": (
+                f"Evaluated {len(evaluated)} predictions with realized prices. "
+                f"{pending_count} predictions are still waiting for future market bars."
+            ),
+        }
+
+    def build_market_report(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        interval: str = "1h",
+        refresh_period: str = "5d",
+        force_refresh: bool = False,
+        auto_predict: bool = True,
+        auto_train: bool = True,
+    ) -> Dict[str, Any]:
         symbols = self._resolve_symbols(symbols)
         items: List[Dict[str, Any]] = []
 
         for symbol in symbols:
             market_data = self.db_manager.get_latest_data(symbol, limit_rows=48, ascending=True)
+            prediction_payload: Optional[Dict[str, Any]] = None
+            prediction_error: Optional[str] = None
+
+            if market_data.empty and auto_predict:
+                try:
+                    prediction_payload = self.generate_prediction(
+                        symbol,
+                        interval=interval,
+                        refresh_period=refresh_period,
+                        force_refresh=force_refresh,
+                        auto_train=auto_train,
+                    )
+                except Exception as exc:
+                    prediction_error = str(exc)
+                    logger.error(f"Prediction refresh failed for {symbol} during report generation: {exc}")
+                market_data = self.db_manager.get_latest_data(symbol, limit_rows=48, ascending=True)
+
             if market_data.empty:
                 continue
 
             recent_frame = self._normalize_market_frame(market_data)
             latest_predictions = self.db_manager.get_latest_predictions(symbol, limit_rows=1, ascending=False)
+            latest_market_timestamp = recent_frame["timestamp"].iloc[-1]
+
+            if auto_predict:
+                needs_prediction = latest_predictions.empty
+                if not needs_prediction:
+                    needs_prediction = not self._prediction_is_fresh(
+                        latest_predictions.iloc[0]["prediction_timestamp"],
+                        latest_market_timestamp,
+                    )
+
+                if needs_prediction:
+                    try:
+                        prediction_payload = self.generate_prediction(
+                            symbol,
+                            interval=interval,
+                            refresh_period=refresh_period,
+                            force_refresh=force_refresh,
+                            auto_train=auto_train,
+                        )
+                        latest_predictions = self.db_manager.get_latest_predictions(
+                            symbol,
+                            limit_rows=1,
+                            ascending=False,
+                        )
+                        prediction_error = None
+                    except Exception as exc:
+                        prediction_error = str(exc)
+                        logger.error(f"Prediction refresh failed for {symbol} during report generation: {exc}")
+
             current_price = float(recent_frame["close"].iloc[-1])
             price_change_24h = 0.0
             if len(recent_frame) > 1 and recent_frame["close"].iloc[0] != 0:
@@ -489,22 +799,24 @@ class AutomationAgent:
                 "avg_volume_24h": float(recent_frame["volume"].tail(24).mean()),
             }
 
-            if not latest_predictions.empty:
+            if prediction_payload is not None:
+                item.update(self._serialize_prediction_for_report(prediction_payload, current_price))
+                item["message"] = (
+                    f"{symbol} closed the latest hour at ${current_price:.2f}. "
+                    f"The latest report estimate is ${item['predicted_price']:.2f} "
+                    f"with {item['confidence_score']:.1f}% confidence."
+                )
+            elif not latest_predictions.empty:
                 latest_prediction = latest_predictions.iloc[0]
                 item.update(
-                    {
-                        "prediction_timestamp": pd.to_datetime(
-                            latest_prediction["prediction_timestamp"], utc=True
-                        ).isoformat(),
-                        "predicted_price": float(latest_prediction["predicted_price"]),
-                        "confidence_score": float(latest_prediction["confidence_score"]),
-                        "predicted_change_pct": round(
-                            ((float(latest_prediction["predicted_price"]) - current_price) / current_price) * 100
-                            if current_price
-                            else 0.0,
-                            4,
-                        ),
-                    }
+                    self._serialize_prediction_for_report(
+                        {
+                            "prediction_timestamp": latest_prediction["prediction_timestamp"],
+                            "predicted_price": latest_prediction["predicted_price"],
+                            "confidence_score": latest_prediction["confidence_score"],
+                        },
+                        current_price,
+                    )
                 )
                 item["message"] = (
                     f"{symbol} closed the latest hour at ${current_price:.2f}. "
@@ -515,10 +827,16 @@ class AutomationAgent:
                 item["predicted_price"] = None
                 item["confidence_score"] = None
                 item["predicted_change_pct"] = 0.0
-                item["message"] = (
-                    f"{symbol} closed the latest hour at ${current_price:.2f}. "
-                    "No model estimate is stored yet."
-                )
+                if prediction_error:
+                    item["message"] = (
+                        f"{symbol} closed the latest hour at ${current_price:.2f}. "
+                        f"A fresh model estimate is not available yet: {prediction_error}"
+                    )
+                else:
+                    item["message"] = (
+                        f"{symbol} closed the latest hour at ${current_price:.2f}. "
+                        "No model estimate is stored yet."
+                    )
             items.append(item)
 
         generated_at = datetime.utcnow().isoformat()
@@ -547,7 +865,7 @@ class AutomationAgent:
             force_refresh=False,
             auto_train=False,
         )
-        report = self.build_market_report(symbols)
+        report = self.build_market_report(symbols, interval=interval, refresh_period="5d", auto_predict=False)
 
         return {
             "symbols": symbols,
@@ -576,7 +894,7 @@ class AutomationAgent:
             force_refresh=False,
             auto_train=True,
         )
-        report = self.build_market_report(symbols)
+        report = self.build_market_report(symbols, interval=interval, refresh_period=refresh_period, auto_predict=False)
 
         return {
             "symbols": symbols,

@@ -14,6 +14,13 @@ class CollectRequest(BaseModel):
     interval: str = "1h"
 
 
+class UniverseCollectRequest(BaseModel):
+    universe: str = "all"
+    symbols: List[str] = Field(default_factory=list)
+    period: str = "1mo"
+    interval: str = "1h"
+
+
 class TrainRequest(BaseModel):
     symbols: List[str] = Field(default_factory=list)
     history_period: str = "6mo"
@@ -111,6 +118,44 @@ def collect_market_data(request: CollectRequest, agent: Any = Depends(get_automa
         _handle_service_error(exc)
 
 
+@app.post("/market-data/collect-universe")
+def collect_market_universe(request: UniverseCollectRequest, agent: Any = Depends(get_automation_agent)):
+    try:
+        return agent.collect_market_universe(
+            universe=request.universe,
+            symbols=request.symbols or None,
+            period=request.period,
+            interval=request.interval,
+        )
+    except Exception as exc:
+        _handle_service_error(exc)
+
+
+@app.get("/market-data/history")
+def market_history(
+    symbols: Optional[List[str]] = Query(None),
+    universe: str = Query("configured"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    exchange: Optional[str] = Query(None),
+    limit: int = Query(1000, ge=1, le=100000),
+    ascending: bool = Query(False),
+    agent: Any = Depends(get_automation_agent),
+):
+    try:
+        return agent.get_market_history(
+            symbols=symbols,
+            universe=universe,
+            start=start,
+            end=end,
+            exchange=exchange,
+            limit_rows=limit,
+            ascending=ascending,
+        )
+    except Exception as exc:
+        _handle_service_error(exc)
+
+
 @app.post("/models/train")
 def train_models(request: TrainRequest, agent: Any = Depends(get_automation_agent)):
     try:
@@ -150,13 +195,48 @@ def latest_predictions(
         _handle_service_error(exc)
 
 
-@app.get("/reports/market-summary")
-def market_summary(
+@app.get("/predictions/evaluate")
+def evaluate_predictions(
     symbols: Optional[List[str]] = Query(None),
+    universe: str = Query("configured"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    limit: int = Query(1000, ge=1, le=100000),
+    sync_actuals: bool = Query(True),
     agent: Any = Depends(get_automation_agent),
 ):
     try:
-        return agent.build_market_report(symbols=symbols)
+        return agent.evaluate_predictions(
+            symbols=symbols,
+            universe=universe,
+            start=start,
+            end=end,
+            limit_rows=limit,
+            sync_actuals=sync_actuals,
+        )
+    except Exception as exc:
+        _handle_service_error(exc)
+
+
+@app.get("/reports/market-summary")
+def market_summary(
+    symbols: Optional[List[str]] = Query(None),
+    interval: str = Query("1h"),
+    refresh_period: str = Query("5d"),
+    force_refresh: bool = Query(False),
+    auto_predict: bool = Query(True),
+    auto_train: bool = Query(True),
+    agent: Any = Depends(get_automation_agent),
+):
+    try:
+        return agent.build_market_report(
+            symbols=symbols,
+            interval=interval,
+            refresh_period=refresh_period,
+            force_refresh=force_refresh,
+            auto_predict=auto_predict,
+            auto_train=auto_train,
+        )
     except Exception as exc:
         _handle_service_error(exc)
 

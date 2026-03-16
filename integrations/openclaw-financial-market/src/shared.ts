@@ -195,6 +195,53 @@ export function formatJsonText(payload: unknown): string {
   return JSON.stringify(payload, null, 2);
 }
 
+export function mergePredictionsIntoReport(
+  report: MarketReportResponse,
+  predictions?: BatchResponse<PredictionRow>,
+): MarketReportResponse {
+  if (!predictions || predictions.completed.length === 0) {
+    return report;
+  }
+
+  const predictionMap = new Map(
+    predictions.completed.map((prediction) => [prediction.symbol.trim().toUpperCase(), prediction]),
+  );
+
+  const items = report.items.map((item) => {
+    const prediction = predictionMap.get(item.symbol.trim().toUpperCase());
+    if (!prediction) {
+      return item;
+    }
+
+    const currentPrice =
+      typeof item.current_price === "number" && Number.isFinite(item.current_price)
+        ? item.current_price
+        : typeof prediction.current_price === "number" && Number.isFinite(prediction.current_price)
+          ? prediction.current_price
+          : undefined;
+
+    const predictedChangePct =
+      typeof currentPrice === "number" && currentPrice !== 0
+        ? ((prediction.predicted_price - currentPrice) / currentPrice) * 100
+        : prediction.predicted_change_pct;
+
+    return {
+      ...item,
+      current_price: currentPrice ?? item.current_price,
+      prediction_timestamp: prediction.prediction_timestamp,
+      predicted_price: prediction.predicted_price,
+      confidence_score: prediction.confidence_score,
+      predicted_change_pct: predictedChangePct,
+      message: prediction.message ?? item.message,
+    };
+  });
+
+  return {
+    ...report,
+    items,
+  };
+}
+
 export function textReply(text: string) {
   return { text };
 }

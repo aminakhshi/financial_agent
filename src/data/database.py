@@ -65,6 +65,11 @@ class PredictionResults(Base):
     actual_price = Column(Float)  # Filled later for evaluation
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
+    __table_args__ = (
+        Index('idx_prediction_symbol_timestamp', 'symbol', 'prediction_timestamp'),
+        Index('idx_prediction_timestamp', 'prediction_timestamp'),
+    )
+
 
 def _create_db_url_from_config() -> str:
     """Create a psycopg2 URL from user-provided DB_* vars in the .env."""
@@ -268,6 +273,46 @@ class DatabaseManager:
             df = df.tail(limit_rows) if ascending else df.head(limit_rows)
         return df.reset_index(drop=True)
 
+    def get_market_history(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        exchange: Optional[str] = None,
+        limit_rows: Optional[int] = 1000,
+        ascending: bool = False,
+    ) -> pd.DataFrame:
+        """Return market history for one or more symbols from SQL storage."""
+        from sqlalchemy import asc, desc, select
+
+        with self.engine.connect() as conn:
+            stmt = select(MarketData)
+            if symbols:
+                normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+                if normalized_symbols:
+                    stmt = stmt.where(MarketData.symbol.in_(normalized_symbols))
+            if exchange:
+                stmt = stmt.where(MarketData.exchange == exchange)
+            if start is not None:
+                stmt = stmt.where(MarketData.timestamp >= pd.to_datetime(start, utc=True).to_pydatetime())
+            if end is not None:
+                stmt = stmt.where(MarketData.timestamp <= pd.to_datetime(end, utc=True).to_pydatetime())
+
+            if limit_rows:
+                stmt = stmt.order_by(desc(MarketData.timestamp)).limit(limit_rows)
+            else:
+                stmt = stmt.order_by(asc(MarketData.timestamp) if ascending else desc(MarketData.timestamp))
+
+            df = pd.read_sql(stmt, conn)
+
+        if df.empty:
+            return df
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        if "created_at" in df.columns:
+            df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+        return df.sort_values("timestamp", ascending=ascending).reset_index(drop=True)
+
     def upsert_prediction_results(self, records: Iterable[dict]) -> int:
         """Insert or update prediction rows keyed by symbol and prediction timestamp."""
         records = list(records)
@@ -317,6 +362,54 @@ class DatabaseManager:
                 .order_by(desc(PredictionResults.prediction_timestamp))
                 .limit(limit_rows)
             )
+            df = pd.read_sql(stmt, conn)
+
+        if df.empty:
+            return df
+
+        df["prediction_timestamp"] = pd.to_datetime(df["prediction_timestamp"], utc=True)
+        if "created_at" in df.columns:
+            df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+        return df.sort_values("prediction_timestamp", ascending=ascending).reset_index(drop=True)
+
+    def get_prediction_history(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        limit_rows: Optional[int] = 1000,
+        ascending: bool = False,
+        only_evaluated: bool = False,
+    ) -> pd.DataFrame:
+        """Return persisted prediction history across one or more symbols."""
+        from sqlalchemy import asc, desc, select
+
+        with self.engine.connect() as conn:
+            stmt = select(PredictionResults)
+            if symbols:
+                normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+                if normalized_symbols:
+                    stmt = stmt.where(PredictionResults.symbol.in_(normalized_symbols))
+            if start is not None:
+                stmt = stmt.where(
+                    PredictionResults.prediction_timestamp >= pd.to_datetime(start, utc=True).to_pydatetime()
+                )
+            if end is not None:
+                stmt = stmt.where(
+                    PredictionResults.prediction_timestamp <= pd.to_datetime(end, utc=True).to_pydatetime()
+                )
+            if only_evaluated:
+                stmt = stmt.where(PredictionResults.actual_price.is_not(None))
+
+            if limit_rows:
+                stmt = stmt.order_by(desc(PredictionResults.prediction_timestamp)).limit(limit_rows)
+            else:
+                stmt = stmt.order_by(
+                    asc(PredictionResults.prediction_timestamp)
+                    if ascending
+                    else desc(PredictionResults.prediction_timestamp)
+                )
+
             df = pd.read_sql(stmt, conn)
 
         if df.empty:

@@ -19,6 +19,7 @@ import {
 } from "./format.js";
 import {
   jsonToolResult,
+  mergePredictionsIntoReport,
   parseBooleanFlag,
   parseNumber,
   resolveDefaultInterval,
@@ -233,6 +234,7 @@ export function createFinancialMarketTools(api: OpenClawPluginApi) {
         const overrides = buildRequestOverrides(params);
         const refresh = parseBooleanFlag(params.refresh, false);
         const train = parseBooleanFlag(params.train, false);
+        let predictionResponse;
 
         if (refresh) {
           await collectMarketData(api, { symbols, period, interval, overrides });
@@ -240,18 +242,17 @@ export function createFinancialMarketTools(api: OpenClawPluginApi) {
         if (train) {
           await trainModels(api, { symbols, historyPeriod, interval, overrides });
         }
-        if (refresh || train) {
-          await generatePredictions(api, {
-            symbols,
-            interval,
-            refreshPeriod: period,
-            autoTrain: true,
-            overrides,
-          });
-        }
+        predictionResponse = await generatePredictions(api, {
+          symbols,
+          interval,
+          refreshPeriod: period,
+          autoTrain: true,
+          overrides,
+        });
 
         const response = await getMarketReportDirect(api, { symbols, overrides });
-        return jsonToolResult(formatReport(response), response);
+        const mergedReport = mergePredictionsIntoReport(response, predictionResponse);
+        return jsonToolResult(formatReport(mergedReport), mergedReport);
       },
     },
     {
