@@ -121,3 +121,25 @@ Use ``python -m main`` when you want a single long-running process to:
 Do not use it as a replacement for explicit long historical backfills if you
 need precise control over time windows, batches, or direct API access.
 
+Automatic bootstrap behavior
+----------------------------
+
+If you want ``python -m main`` or the ``financial_app`` Docker service to
+perform a long historical bootstrap automatically, enable the startup backfill
+environment variables:
+
+.. code-block:: bash
+
+   export STARTUP_DAILY_BACKFILL_ENABLED=true
+   export STARTUP_DAILY_BACKFILL_UNIVERSE=sp500
+   export STARTUP_DAILY_BACKFILL_START=1991-01-01
+   export STARTUP_DAILY_BACKFILL_BATCH_SIZE=25
+
+For ongoing daily ``1d`` market maintenance after the bootstrap:
+
+.. code-block:: bash
+
+   export ENABLE_DAILY_MARKET_UPDATE=true
+   export DAILY_MARKET_UPDATE_UNIVERSE=sp500
+   export DAILY_MARKET_UPDATE_PERIOD=7d
+   export DAILY_MARKET_UPDATE_TIME=18:30

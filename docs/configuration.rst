@@ -80,6 +80,31 @@ Important runtime knobs from ``src/config/settings.py``:
 * ``HOURLY_PREDICTION_REFRESH_PERIOD``
 * ``DISABLE_CREWAI``
 
+Startup and scheduled backfill knobs
+------------------------------------
+
+These variables control long-running bootstrap and maintenance behavior for
+``python -m main`` and the ``financial_app`` Docker service:
+
+* ``STARTUP_DAILY_BACKFILL_ENABLED``
+* ``STARTUP_DAILY_BACKFILL_UNIVERSE``
+* ``STARTUP_DAILY_BACKFILL_START``
+* ``STARTUP_DAILY_BACKFILL_END``
+* ``STARTUP_DAILY_BACKFILL_BATCH_SIZE``
+* ``STARTUP_HOURLY_BACKFILL_ENABLED``
+* ``STARTUP_HOURLY_BACKFILL_UNIVERSE``
+* ``STARTUP_HOURLY_BACKFILL_PERIOD``
+* ``STARTUP_HOURLY_BACKFILL_END``
+* ``STARTUP_HOURLY_BACKFILL_BATCH_SIZE``
+* ``ENABLE_DAILY_MARKET_UPDATE``
+* ``DAILY_MARKET_UPDATE_UNIVERSE``
+* ``DAILY_MARKET_UPDATE_PERIOD``
+* ``DAILY_MARKET_UPDATE_TIME``
+* ``DAILY_MARKET_UPDATE_BATCH_SIZE``
+
+Without these flags, the integrated service only runs the default watchlist
+pipeline. It does not automatically perform the full S&P 500 daily bootstrap.
+
 Default universes:
 
 * default watchlist
@@ -103,4 +128,3 @@ Security notes
 
 Do not commit local tokens, database passwords, Telegram bot tokens, or other
 private credentials. Keep them in local env files or external secret stores.
-

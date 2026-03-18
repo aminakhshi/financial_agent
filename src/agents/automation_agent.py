@@ -388,15 +388,51 @@ class AutomationAgent:
         range_label = f"start={start}, end={end or 'latest'}" if start or end else f"period {period}"
         logger.info(f"Collecting {interval} market data for {', '.join(symbols)} using {range_label}.")
 
-        market_data = self.data_collector.fetch_yfinance_data(
+        total_rows = 0
+        total_symbols = set()
+        rows_by_symbol: Dict[str, int] = {}
+        total_actuals_updated = 0
+        batch_count = 0
+
+        for batch_data in self.data_collector.iter_yfinance_data_batches(
             symbols,
             period=period,
             interval=interval,
             start=start,
             end=end,
             batch_size=batch_size,
-        )
-        if market_data.empty:
+        ):
+            if batch_data.empty:
+                continue
+
+            market_data = batch_data.copy()
+            market_data["symbol"] = market_data["symbol"].astype(str).str.upper()
+            market_data["exchange"] = market_data["symbol"].map(self.exchange_lookup).fillna("US")
+            market_data["timeframe"] = interval
+            self.db_manager.insert_market_data(market_data)
+
+            batch_symbols = sorted({str(symbol).upper() for symbol in market_data["symbol"].tolist()})
+            batch_actuals_updated = self.db_manager.sync_prediction_actuals(batch_symbols, timeframe=interval)
+
+            batch_rows_by_symbol = {
+                symbol: int(count) for symbol, count in market_data.groupby("symbol").size().to_dict().items()
+            }
+            for symbol, count in batch_rows_by_symbol.items():
+                rows_by_symbol[symbol] = rows_by_symbol.get(symbol, 0) + count
+                total_symbols.add(symbol)
+
+            total_rows += int(len(market_data))
+            total_actuals_updated += int(batch_actuals_updated)
+            batch_count += 1
+            logger.info(
+                "Stored provider batch {}: {} rows across {} symbols. Cumulative rows: {}.",
+                batch_count,
+                len(market_data),
+                len(batch_rows_by_symbol),
+                total_rows,
+            )
+
+        if total_rows == 0:
             return {
                 "status": "no_data",
                 "symbols": symbols,
@@ -406,19 +442,9 @@ class AutomationAgent:
                 "timestamp": datetime.utcnow().isoformat(),
             }
 
-        market_data = market_data.copy()
-        market_data["symbol"] = market_data["symbol"].astype(str).str.upper()
-        market_data["exchange"] = market_data["symbol"].map(self.exchange_lookup).fillna("US")
-        market_data["timeframe"] = interval
-        self.db_manager.insert_market_data(market_data)
-        actuals_updated = self.db_manager.sync_prediction_actuals(symbols, timeframe=interval)
-        rows_by_symbol = {
-            symbol: int(count) for symbol, count in market_data.groupby("symbol").size().to_dict().items()
-        }
-
         message = (
-            f"Collected {len(market_data)} rows across {len(rows_by_symbol)} symbols. "
-            f"Updated {actuals_updated} prediction records with realized prices."
+            f"Collected {total_rows} rows across {len(rows_by_symbol)} symbols in {batch_count} provider batches. "
+            f"Updated {total_actuals_updated} prediction records with realized prices."
         )
         return {
             "status": "ok",
@@ -427,9 +453,9 @@ class AutomationAgent:
             "interval": interval,
             "start": start,
             "end": end,
-            "rows_collected": int(len(market_data)),
+            "rows_collected": int(total_rows),
             "rows_by_symbol": rows_by_symbol,
-            "actuals_updated": int(actuals_updated),
+            "actuals_updated": int(total_actuals_updated),
             "message": message,
             "timestamp": datetime.utcnow().isoformat(),
         }
@@ -1355,6 +1381,38 @@ class AutomationAgent:
             "message": "The hourly market update completed.",
         }
 
+    def run_daily_market_update(self) -> Dict[str, Any]:
+        universe = os.getenv("DAILY_MARKET_UPDATE_UNIVERSE", "sp500").strip() or "sp500"
+        period = os.getenv("DAILY_MARKET_UPDATE_PERIOD", "7d").strip() or "7d"
+        batch_size_raw = os.getenv("DAILY_MARKET_UPDATE_BATCH_SIZE", "25").strip() or "25"
+        try:
+            batch_size = max(int(batch_size_raw), 1)
+        except ValueError:
+            logger.warning(
+                "Invalid DAILY_MARKET_UPDATE_BATCH_SIZE='{}'. Falling back to 25.",
+                batch_size_raw,
+            )
+            batch_size = 25
+
+        logger.info(
+            "Running scheduled daily market update for universe '{}' using period {} and batch size {}.",
+            universe,
+            period,
+            batch_size,
+        )
+        result = self.collect_market_universe(
+            universe=universe,
+            period=period,
+            interval="1d",
+            batch_size=batch_size,
+        )
+        logger.info(
+            "Daily market update stored {} rows across {} symbols.",
+            result.get("rows_collected", 0),
+            result.get("stored_symbol_count", 0),
+        )
+        return result
+
     def schedule_operations(self):
         """Schedule regular operations."""
         import schedule
@@ -1362,6 +1420,20 @@ class AutomationAgent:
 
         schedule.every().hour.do(self.run_hourly_update)
         schedule.every().day.at("02:00").do(lambda: asyncio.run(self.run_full_pipeline()))
+
+        if os.getenv("ENABLE_DAILY_MARKET_UPDATE", "false").strip().lower() in {"1", "true", "yes", "on"}:
+            update_time = os.getenv("DAILY_MARKET_UPDATE_TIME", "18:30").strip() or "18:30"
+            schedule.every().day.at(update_time).do(self.run_daily_market_update)
+            logger.info(
+                "Scheduled daily universe refresh at {} for universe '{}'.",
+                update_time,
+                os.getenv("DAILY_MARKET_UPDATE_UNIVERSE", "sp500").strip() or "sp500",
+            )
+        else:
+            logger.info(
+                "Scheduled daily universe refresh is disabled. "
+                "Enable it with ENABLE_DAILY_MARKET_UPDATE=true if you want ongoing 1d updates."
+            )
 
         logger.info("Scheduler started. Waiting for the next market update window.")
         while True:

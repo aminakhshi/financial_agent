@@ -26,6 +26,29 @@ def _sqlite_fallback_enabled():
     return sqlite_fallback_enabled(default=True)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"Invalid integer for {name}: {raw}. Using default {default}.")
+        return default
+
+
+def _optional_env(name: str) -> str | None:
+    value = os.getenv(name, "").strip()
+    return value or None
+
+
 def configure_logging():
     log_file_path = os.path.join("logs", "financial_agent_{time}.log")
     logger.remove()
@@ -78,15 +101,17 @@ def setup_agents(db_manager):
 def run_dashboard():
     """Generates Streamlit dashboard in a separate, non-blocking process."""
     dashboard_path = os.path.join(os.path.dirname(__file__), 'dashboard', 'app.py')
+    dashboard_host = os.getenv("STREAMLIT_SERVER_ADDRESS", "127.0.0.1").strip() or "127.0.0.1"
+    dashboard_port = os.getenv("STREAMLIT_SERVER_PORT", "8501").strip() or "8501"
     # Use Popen for non-blocking execution
     command = [
         'streamlit',
         'run',
         dashboard_path,
         '--server.port',
-        '8501',
+        dashboard_port,
         '--server.address',
-        '127.0.0.1',
+        dashboard_host,
         '--server.headless',
         'true',
         '--browser.gatherUsageStats',
@@ -95,8 +120,68 @@ def run_dashboard():
     
     # Using Popen to run the dashboard as a background process
     proc = subprocess.Popen(command)
-    logger.info(f"Dashboard process started with PID: {proc.pid}")
+    logger.info(f"Dashboard process started with PID: {proc.pid} on http://{dashboard_host}:{dashboard_port}.")
     return proc
+
+
+def run_startup_backfills(orchestrator):
+    daily_enabled = _env_flag("STARTUP_DAILY_BACKFILL_ENABLED", default=False)
+    hourly_enabled = _env_flag("STARTUP_HOURLY_BACKFILL_ENABLED", default=False)
+
+    if not daily_enabled and not hourly_enabled:
+        logger.info(
+            "Startup backfills are disabled. The service will only run the default watchlist pipeline "
+            "unless a backfill endpoint is called explicitly."
+        )
+        return
+
+    if daily_enabled:
+        daily_universe = os.getenv("STARTUP_DAILY_BACKFILL_UNIVERSE", "sp500").strip() or "sp500"
+        daily_start = os.getenv("STARTUP_DAILY_BACKFILL_START", "1991-01-01").strip() or "1991-01-01"
+        daily_end = _optional_env("STARTUP_DAILY_BACKFILL_END")
+        daily_batch_size = _env_int("STARTUP_DAILY_BACKFILL_BATCH_SIZE", 25)
+        logger.info(
+            "Starting startup daily backfill for universe '{}' from {} through {} (batch size {}).",
+            daily_universe,
+            daily_start,
+            daily_end or "latest",
+            daily_batch_size,
+        )
+        daily_result = orchestrator.backfill_daily_history(
+            universe=daily_universe,
+            start=daily_start,
+            end=daily_end,
+            batch_size=daily_batch_size,
+        )
+        logger.success(
+            "Startup daily backfill stored {} rows across {} symbols.",
+            daily_result.get("rows_collected", 0),
+            daily_result.get("stored_symbol_count", 0),
+        )
+
+    if hourly_enabled:
+        hourly_universe = os.getenv("STARTUP_HOURLY_BACKFILL_UNIVERSE", "sp500").strip() or "sp500"
+        hourly_period = os.getenv("STARTUP_HOURLY_BACKFILL_PERIOD", "6mo").strip() or "6mo"
+        hourly_end = _optional_env("STARTUP_HOURLY_BACKFILL_END")
+        hourly_batch_size = _env_int("STARTUP_HOURLY_BACKFILL_BATCH_SIZE", 25)
+        logger.info(
+            "Starting startup hourly backfill for universe '{}' over {} through {} (batch size {}).",
+            hourly_universe,
+            hourly_period,
+            hourly_end or "latest",
+            hourly_batch_size,
+        )
+        hourly_result = orchestrator.backfill_hourly_history(
+            universe=hourly_universe,
+            period=hourly_period,
+            end=hourly_end,
+            batch_size=hourly_batch_size,
+        )
+        logger.success(
+            "Startup hourly backfill stored {} rows across {} symbols.",
+            hourly_result.get("rows_collected", 0),
+            hourly_result.get("stored_symbol_count", 0),
+        )
 
 async def main():
     """The main entry point for our financial agent."""
@@ -134,6 +219,8 @@ async def main():
         dashboard_thread.daemon = True
         dashboard_thread.start()
         logger.info("Dashboard is available at http://localhost:8501.")
+
+        run_startup_backfills(orchestrator)
 
         logger.info("Starting the initial market pipeline run.")
         await orchestrator.run_full_pipeline()

@@ -79,12 +79,16 @@ Common causes:
 * the API process is still running stale code from before a patch
 * the request failed and wrote an error response to the output file instead of
   a success summary
+* the integrated service was started without any startup backfill flags, so it
+  only ran the default 5-symbol hourly pipeline
 
 Fix:
 
 * restart ``uvicorn`` after code changes
 * inspect the saved response file
 * inspect ``financial_data.db`` directly with ``sqlite3``
+* if using ``python -m main`` or ``financial_app``, enable the startup
+  backfill variables when you expect a full historical bootstrap
 
 No predictions for a symbol
 ---------------------------
@@ -110,4 +114,3 @@ If OpenClaw reports ``plugin not found`` or continues to use stale plugin code:
 * relink the plugin path
 * restart the OpenClaw gateway
 * confirm the plugin config points to the correct API base URL
-

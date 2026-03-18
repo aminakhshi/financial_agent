@@ -9,6 +9,13 @@ import os
 from typing import Iterable, List, Optional
 
 try:
+    from loguru import logger
+except Exception:  # pragma: no cover - fallback for minimal environments
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+try:
     from langchain.llms.base import LLM as BaseLLM
 except ImportError:
     from langchain_core.language_models.llms import LLM as BaseLLM
@@ -234,6 +241,107 @@ class DataCollectorAgent:
         data = yf.Ticker(symbol).history(**kwargs)
         return self._format_history_frame(data, symbol, interval)
 
+    def _fetch_batch_frames(
+        self,
+        batch: List[str],
+        period: Optional[str],
+        interval: str,
+        start: Optional[str],
+        end: Optional[str],
+    ) -> List[pd.DataFrame]:
+        batch_frames: List[pd.DataFrame] = []
+        try:
+            data = self._download_batch(batch, period=period, interval=interval, start=start, end=end)
+            if isinstance(data.columns, pd.MultiIndex):
+                available_symbols = set(data.columns.get_level_values(0))
+                for symbol in batch:
+                    if symbol not in available_symbols:
+                        continue
+                    formatted = self._format_history_frame(data[symbol], symbol, interval)
+                    if not formatted.empty:
+                        batch_frames.append(formatted)
+            else:
+                symbol = batch[0]
+                formatted = self._format_history_frame(data, symbol, interval)
+                if not formatted.empty:
+                    batch_frames.append(formatted)
+        except Exception as exc:
+            logger.warning("Error fetching batched data for {}: {}", ", ".join(batch), exc)
+
+        fetched_symbols = {frame["symbol"].iloc[0] for frame in batch_frames if not frame.empty}
+        for symbol in batch:
+            if symbol in fetched_symbols:
+                continue
+            try:
+                formatted = self._fetch_single_symbol(
+                    symbol,
+                    period=period,
+                    interval=interval,
+                    start=start,
+                    end=end,
+                )
+                if not formatted.empty:
+                    batch_frames.append(formatted)
+            except Exception as exc:
+                logger.warning("Error fetching data for {}: {}", symbol, exc)
+
+        return batch_frames
+
+    def iter_yfinance_data_batches(
+        self,
+        symbols,
+        period="1d",
+        interval="1h",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        batch_size: Optional[int] = None,
+    ):
+        normalized_symbols = self._normalize_symbols(symbols)
+        if not normalized_symbols:
+            return
+
+        batch_size = max(int(batch_size or self.config["MARKET_CONFIG"].get("download_batch_size", 25)), 1)
+        total_batches = max((len(normalized_symbols) + batch_size - 1) // batch_size, 1)
+        range_label = f"start={start}, end={end or 'latest'}" if start or end else f"period={period}"
+
+        for batch_number, index in enumerate(range(0, len(normalized_symbols), batch_size), start=1):
+            batch = normalized_symbols[index:index + batch_size]
+            logger.info(
+                "Fetching provider batch {}/{} for {} symbols using {} {}.",
+                batch_number,
+                total_batches,
+                len(batch),
+                interval,
+                range_label,
+            )
+            batch_frames = self._fetch_batch_frames(
+                batch,
+                period=period,
+                interval=interval,
+                start=start,
+                end=end,
+            )
+            if not batch_frames:
+                logger.warning(
+                    "No provider data was returned for batch {}/{} ({}).",
+                    batch_number,
+                    total_batches,
+                    ", ".join(batch),
+                )
+                time.sleep(0.1)
+                continue
+
+            batch_df = pd.concat(batch_frames, ignore_index=True)
+            logger.info(
+                "Fetched {} rows across {} symbols in batch {}/{}.",
+                len(batch_df),
+                batch_df["symbol"].nunique(),
+                batch_number,
+                total_batches,
+            )
+            yield batch_df
+            time.sleep(0.1)
+
     def fetch_yfinance_data(
         self,
         symbols,
@@ -244,52 +352,16 @@ class DataCollectorAgent:
         batch_size: Optional[int] = None,
     ):
         """Fetch market data using batched yfinance downloads."""
-        normalized_symbols = self._normalize_symbols(symbols)
-        if not normalized_symbols:
-            return pd.DataFrame()
-
-        batch_size = max(int(batch_size or self.config["MARKET_CONFIG"].get("download_batch_size", 25)), 1)
-        all_data = []
-
-        for index in range(0, len(normalized_symbols), batch_size):
-            batch = normalized_symbols[index:index + batch_size]
-            try:
-                data = self._download_batch(batch, period=period, interval=interval, start=start, end=end)
-                if isinstance(data.columns, pd.MultiIndex):
-                    available_symbols = set(data.columns.get_level_values(0))
-                    for symbol in batch:
-                        if symbol not in available_symbols:
-                            continue
-                        formatted = self._format_history_frame(data[symbol], symbol, interval)
-                        if not formatted.empty:
-                            all_data.append(formatted)
-                else:
-                    symbol = batch[0]
-                    formatted = self._format_history_frame(data, symbol, interval)
-                    if not formatted.empty:
-                        all_data.append(formatted)
-            except Exception as exc:
-                print(f"Error fetching batched data for {', '.join(batch)}: {exc}")
-
-            fetched_symbols = {frame["symbol"].iloc[0] for frame in all_data if not frame.empty}
-            for symbol in batch:
-                if symbol in fetched_symbols:
-                    continue
-                try:
-                    formatted = self._fetch_single_symbol(
-                        symbol,
-                        period=period,
-                        interval=interval,
-                        start=start,
-                        end=end,
-                    )
-                    if not formatted.empty:
-                        all_data.append(formatted)
-                except Exception as exc:
-                    print(f"Error fetching data for {symbol}: {exc}")
-
-            time.sleep(0.1)
-
+        all_data = list(
+            self.iter_yfinance_data_batches(
+                symbols,
+                period=period,
+                interval=interval,
+                start=start,
+                end=end,
+                batch_size=batch_size,
+            )
+        )
         return pd.concat(all_data, ignore_index=True) if all_data else pd.DataFrame()
     
     def fetch_alpha_vantage_data(self, symbol):
