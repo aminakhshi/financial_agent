@@ -33,12 +33,21 @@ var/
 
 # Database files
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 
 # Logs
 logs/
 *.log
+
+# Documentation build output
+docs/_build/
 
 # VS Code
 .vscode/

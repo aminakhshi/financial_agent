@@ -186,7 +186,24 @@ class DataCollectorAgent:
         frame["symbol"] = symbol
         frame["timestamp"] = pd.to_datetime(frame[timestamp_column], utc=True)
         frame["timeframe"] = interval
-        return frame[["symbol", "timestamp", "open", "high", "low", "close", "volume", "timeframe"]]
+        frame = frame[["symbol", "timestamp", "open", "high", "low", "close", "volume", "timeframe"]]
+
+        # yfinance often returns pre-listing rows as all-NaN when a wide start date
+        # is requested for newer symbols. Drop those rows so historical backfills
+        # continue from the first real trading session instead of failing the batch.
+        frame = frame.dropna(subset=["open", "high", "low", "close"])
+        frame = frame[frame["timestamp"].notna()]
+        if frame.empty:
+            return pd.DataFrame()
+
+        # Keep rows only when numeric fields are valid. Volume can be zero, but not null.
+        frame["volume"] = frame["volume"].fillna(0.0)
+        numeric_columns = ["open", "high", "low", "close", "volume"]
+        for column in numeric_columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = frame.dropna(subset=numeric_columns)
+
+        return frame.reset_index(drop=True)
 
     def _download_batch(
         self,

@@ -37,15 +37,20 @@ class FinancialDashboard:
 
         predictions = pd.DataFrame()
         if use_predictions:
-            predictions = self.db_manager.get_latest_predictions(symbol, limit_rows=pred_limit, ascending=True)
+            predictions = self.db_manager.get_latest_predictions(
+                symbol,
+                limit_rows=pred_limit,
+                timeframe=timeframe,
+                ascending=True,
+            )
 
         return market_data, predictions
 
     def load_market_coverage(self, symbols=None, timeframe=None):
         return self.db_manager.get_market_coverage(symbols=symbols, timeframe=timeframe)
 
-    def load_prediction_coverage(self, symbols=None):
-        return self.db_manager.get_prediction_coverage(symbols=symbols)
+    def load_prediction_coverage(self, symbols=None, timeframe=None):
+        return self.db_manager.get_prediction_coverage(symbols=symbols, timeframe=timeframe)
 
     def list_stored_symbols(self, timeframe=None):
         return self.db_manager.get_available_symbols(timeframe=timeframe)
@@ -62,7 +67,7 @@ class FinancialDashboard:
             )
         )
 
-        if timeframe == "1h" and not predictions.empty:
+        if not predictions.empty:
             fig.add_trace(
                 go.Scatter(
                     x=predictions["prediction_timestamp"],
@@ -247,6 +252,7 @@ def main():
     )
     prediction_coverage = dashboard.load_prediction_coverage(
         symbols=None if universe_name == "Stored symbols" else universe_symbols,
+        timeframe=timeframe,
     )
 
     market_data, predictions = dashboard.load_data(
@@ -254,7 +260,7 @@ def main():
         timeframe=timeframe,
         rows=rows_to_plot,
         pred_limit=prediction_rows,
-        use_predictions=(timeframe == "1h"),
+        use_predictions=True,
     )
 
     if market_data.empty:
@@ -292,10 +298,8 @@ def main():
             coverage_col2.metric("First bar", "n/a")
             coverage_col3.metric("Last bar", "n/a")
 
-        if timeframe == "1h" and predictions.empty:
+        if predictions.empty:
             st.info("No prediction history is stored yet for this symbol.")
-        elif timeframe == "1d":
-            st.info("The prediction overlay is shown for hourly model outputs only. Daily data is displayed for coverage and history review.")
 
         st.plotly_chart(
             dashboard.create_price_chart(market_data, predictions, selected_symbol, timeframe),
@@ -362,7 +366,7 @@ def main():
         market_preview["timestamp"] = market_preview["timestamp"].dt.strftime("%Y-%m-%d %H:%M UTC")
         st.dataframe(market_preview.tail(50), use_container_width=True, hide_index=True)
 
-        if timeframe == "1h" and not predictions.empty:
+        if not predictions.empty:
             prediction_preview = predictions.copy()
             prediction_preview["prediction_timestamp"] = prediction_preview["prediction_timestamp"].dt.strftime(
                 "%Y-%m-%d %H:%M UTC"

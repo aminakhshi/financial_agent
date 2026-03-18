@@ -107,15 +107,58 @@ MARKET_CONFIG = {
     'lookback_days': 365,
     'sp500_daily_backfill_start': '1991-01-01',
     'sp500_hourly_backfill_period': '6mo',
+    'daily_model_training_period': os.getenv('DAILY_MODEL_TRAINING_PERIOD', '10y'),
+    'daily_prediction_refresh_period': os.getenv('DAILY_PREDICTION_REFRESH_PERIOD', '1y'),
+    'hourly_model_training_period': os.getenv('HOURLY_MODEL_TRAINING_PERIOD', '6mo'),
+    'hourly_prediction_refresh_period': os.getenv('HOURLY_PREDICTION_REFRESH_PERIOD', '5d'),
     'download_batch_size': int(os.getenv('DOWNLOAD_BATCH_SIZE', '25')),
 }
 
 # Model training configuration
 MODEL_CONFIG = {
-    'sequence_length': 60,  # 60 hours of data
+    'sequence_length': 60,
     'batch_size': 32,
-    'epochs': 100,
-    'learning_rate': 0.001,
+    'epochs': 80,
+    'learning_rate': 0.0007,
     'train_test_split': 0.8,
-    'features': ['open', 'high', 'low', 'close', 'volume', 'sma_20', 'rsi', 'macd']
+    'features': [
+        'open', 'high', 'low', 'close', 'volume',
+        'sma_20', 'ema_12', 'rsi', 'macd', 'macd_signal',
+        'bollinger_upper', 'bollinger_lower',
+        'return_1', 'return_5', 'volatility_10', 'momentum_10',
+        'price_to_sma_20', 'price_to_ema_12', 'volume_ratio_10',
+        'high_low_range', 'open_close_range'
+    ],
+    'fine_tune_learning_rate': 0.00015,
+    'fine_tune_epochs': 6,
+    'monitoring': {
+        'cooldown_predictions': 2,
+        'lookback_evaluations': 12,
+    },
+    'interval_overrides': {
+        '1h': {
+            'sequence_length': 72,
+            'epochs': 50,
+            'learning_rate': 0.0007,
+            'batch_size': 32,
+            'min_training_rows': 140,
+            'fine_tune_epochs': 4,
+            'recent_tune_window': 240,
+            'accuracy_floor_pct': 94.0,
+            'allowed_accuracy_drop_pct': 1.5,
+            'consecutive_drop_limit': 4,
+        },
+        '1d': {
+            'sequence_length': 90,
+            'epochs': 90,
+            'learning_rate': 0.0005,
+            'batch_size': 16,
+            'min_training_rows': 220,
+            'fine_tune_epochs': 8,
+            'recent_tune_window': 504,
+            'accuracy_floor_pct': 96.0,
+            'allowed_accuracy_drop_pct': 1.0,
+            'consecutive_drop_limit': 3,
+        },
+    },
 }

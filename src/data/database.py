@@ -61,6 +61,7 @@ class PredictionResults(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     symbol = Column(String(10), nullable=False)
+    timeframe = Column(String(10), nullable=False, default="1h")
     prediction_timestamp = Column(DateTime, nullable=False)
     predicted_price = Column(Float, nullable=False)
     confidence_score = Column(Float, nullable=False)
@@ -69,8 +70,30 @@ class PredictionResults(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
+        UniqueConstraint('symbol', 'timeframe', 'prediction_timestamp', name='uq_prediction_symbol_timeframe_ts'),
         Index('idx_prediction_symbol_timestamp', 'symbol', 'prediction_timestamp'),
         Index('idx_prediction_timestamp', 'prediction_timestamp'),
+        Index('idx_prediction_symbol_timeframe_timestamp', 'symbol', 'timeframe', 'prediction_timestamp'),
+    )
+
+
+class ModelMonitorEvent(Base):
+    __tablename__ = 'model_monitor_events'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(10), nullable=False)
+    timeframe = Column(String(10), nullable=False)
+    prediction_timestamp = Column(DateTime)
+    observed_accuracy_pct = Column(Float)
+    observed_mape = Column(Float)
+    degradation_streak = Column(Integer, nullable=False, default=0)
+    action = Column(String(50), nullable=False)
+    model_version = Column(String(50))
+    note = Column(String(500))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        Index('idx_monitor_symbol_timeframe_created', 'symbol', 'timeframe', 'created_at'),
     )
 
 
@@ -105,6 +128,7 @@ class DatabaseManager:
         # Expose model classes for callers that reference them via manager instance.
         self.MarketData = MarketData
         self.PredictionResults = PredictionResults
+        self.ModelMonitorEvent = ModelMonitorEvent
         self.use_sqlite_fallback = use_sqlite_fallback
         try:
             if config is None:
@@ -206,6 +230,7 @@ class DatabaseManager:
         self._wait_for_db()
         Base.metadata.create_all(self.engine)
         self._ensure_marketdata_schema()
+        self._ensure_prediction_schema()
 
     def _ensure_marketdata_schema(self):
         inspector = inspect(self.engine)
@@ -217,33 +242,36 @@ class DatabaseManager:
             if "timeframe" not in columns:
                 conn.execute(text("ALTER TABLE market_data ADD COLUMN timeframe VARCHAR(10) DEFAULT '1h'"))
             conn.execute(text("UPDATE market_data SET timeframe = '1h' WHERE timeframe IS NULL"))
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_marketdata_symbol_timeframe_timestamp "
+                    "ON market_data(symbol, timeframe, timestamp)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_marketdata_exchange_timeframe_timestamp "
+                    "ON market_data(exchange, timeframe, timestamp)"
+                )
+            )
 
-            if self.is_sqlite:
-                conn.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS idx_marketdata_symbol_timeframe_timestamp "
-                        "ON market_data(symbol, timeframe, timestamp)"
-                    )
+    def _ensure_prediction_schema(self):
+        inspector = inspect(self.engine)
+        if "prediction_results" not in inspector.get_table_names():
+            return
+
+        columns = {column["name"] for column in inspector.get_columns("prediction_results")}
+        with self.engine.begin() as conn:
+            if "timeframe" not in columns:
+                conn.execute(text("ALTER TABLE prediction_results ADD COLUMN timeframe VARCHAR(10) DEFAULT '1h'"))
+            conn.execute(text("UPDATE prediction_results SET timeframe = '1h' WHERE timeframe IS NULL"))
+
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_prediction_symbol_timeframe_timestamp "
+                    "ON prediction_results(symbol, timeframe, prediction_timestamp)"
                 )
-                conn.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS idx_marketdata_exchange_timeframe_timestamp "
-                        "ON market_data(exchange, timeframe, timestamp)"
-                    )
-                )
-            else:
-                conn.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS idx_marketdata_symbol_timeframe_timestamp "
-                        "ON market_data(symbol, timeframe, timestamp)"
-                    )
-                )
-                conn.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS idx_marketdata_exchange_timeframe_timestamp "
-                        "ON market_data(exchange, timeframe, timestamp)"
-                    )
-                )
+            )
 
     def insert_market_data(self, df: pd.DataFrame, exchange: Optional[str] = None):
         """Insert market data with handling for both PostgreSQL and SQLite."""
@@ -258,7 +286,16 @@ class DatabaseManager:
 
         if exchange is None and "exchange" not in df.columns:
             raise ValueError("Exchange must be provided either as an argument or a dataframe column.")
-        
+
+        df = df.copy()
+        numeric_columns = ["open", "high", "low", "close", "volume"]
+        for column in numeric_columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+        df = df.dropna(subset=["symbol", "timestamp", "open", "high", "low", "close"])
+        df["volume"] = df["volume"].fillna(0.0)
+        if df.empty:
+            return
+
         if self.is_sqlite:
             self._insert_market_data_sqlite(df, exchange)
         else:
@@ -456,11 +493,13 @@ class DatabaseManager:
                 prediction_timestamp = pd.to_datetime(record["prediction_timestamp"], utc=True).to_pydatetime()
                 existing = session.query(PredictionResults).filter(
                     PredictionResults.symbol == record["symbol"],
+                    PredictionResults.timeframe == record.get("timeframe", "1h"),
                     PredictionResults.prediction_timestamp == prediction_timestamp,
                 ).first()
 
                 values = {
                     "symbol": record["symbol"],
+                    "timeframe": record.get("timeframe", "1h"),
                     "prediction_timestamp": prediction_timestamp,
                     "predicted_price": float(record["predicted_price"]),
                     "confidence_score": float(record["confidence_score"]),
@@ -481,6 +520,7 @@ class DatabaseManager:
         self,
         symbol: str,
         limit_rows: int = 24,
+        timeframe: Optional[str] = None,
         ascending: bool = False,
     ) -> pd.DataFrame:
         """Return recent predictions for a symbol."""
@@ -493,6 +533,8 @@ class DatabaseManager:
                 .order_by(desc(PredictionResults.prediction_timestamp))
                 .limit(limit_rows)
             )
+            if timeframe:
+                stmt = stmt.where(PredictionResults.timeframe == timeframe)
             df = pd.read_sql(stmt, conn)
 
         if df.empty:
@@ -508,6 +550,7 @@ class DatabaseManager:
         symbols: Optional[Iterable[str]] = None,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
+        timeframe: Optional[str] = None,
         limit_rows: Optional[int] = 1000,
         ascending: bool = False,
         only_evaluated: bool = False,
@@ -521,6 +564,8 @@ class DatabaseManager:
                 normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
                 if normalized_symbols:
                     stmt = stmt.where(PredictionResults.symbol.in_(normalized_symbols))
+            if timeframe:
+                stmt = stmt.where(PredictionResults.timeframe == timeframe)
             if start is not None:
                 stmt = stmt.where(
                     PredictionResults.prediction_timestamp >= pd.to_datetime(start, utc=True).to_pydatetime()
@@ -554,12 +599,14 @@ class DatabaseManager:
     def get_prediction_coverage(
         self,
         symbols: Optional[Iterable[str]] = None,
+        timeframe: Optional[str] = None,
     ) -> pd.DataFrame:
         from sqlalchemy import case, func, select
 
         with self.engine.connect() as conn:
             stmt = select(
                 PredictionResults.symbol.label("symbol"),
+                PredictionResults.timeframe.label("timeframe"),
                 func.count().label("prediction_count"),
                 func.sum(case((PredictionResults.actual_price.is_not(None), 1), else_=0)).label("evaluated_count"),
                 func.sum(case((PredictionResults.actual_price.is_(None), 1), else_=0)).label("pending_actual_count"),
@@ -570,7 +617,12 @@ class DatabaseManager:
                 normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
                 if normalized_symbols:
                     stmt = stmt.where(PredictionResults.symbol.in_(normalized_symbols))
-            stmt = stmt.group_by(PredictionResults.symbol).order_by(PredictionResults.symbol.asc())
+            if timeframe:
+                stmt = stmt.where(PredictionResults.timeframe == timeframe)
+            stmt = stmt.group_by(PredictionResults.symbol, PredictionResults.timeframe).order_by(
+                PredictionResults.symbol.asc(),
+                PredictionResults.timeframe.asc(),
+            )
             df = pd.read_sql(stmt, conn)
 
         if df.empty:
@@ -583,7 +635,11 @@ class DatabaseManager:
         ).fillna(0.0)
         return df.reset_index(drop=True)
 
-    def sync_prediction_actuals(self, symbols: Optional[Iterable[str]] = None) -> int:
+    def sync_prediction_actuals(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        timeframe: Optional[str] = None,
+    ) -> int:
         """Fill actual prices for predictions once matching market bars are available."""
         with self.Session() as session:
             pending_query = session.query(PredictionResults).filter(
@@ -591,6 +647,8 @@ class DatabaseManager:
             )
             if symbols:
                 pending_query = pending_query.filter(PredictionResults.symbol.in_(list(symbols)))
+            if timeframe:
+                pending_query = pending_query.filter(PredictionResults.timeframe == timeframe)
 
             pending_predictions = pending_query.all()
             updated = 0
@@ -599,6 +657,7 @@ class DatabaseManager:
                     session.query(MarketData)
                     .filter(
                         MarketData.symbol == prediction.symbol,
+                        MarketData.timeframe == prediction.timeframe,
                         MarketData.timestamp == prediction.prediction_timestamp,
                     )
                     .order_by(MarketData.created_at.desc())
@@ -614,6 +673,52 @@ class DatabaseManager:
             else:
                 session.rollback()
         return updated
+
+    def insert_monitor_event(self, record: dict) -> int:
+        with self.Session() as session:
+            event = ModelMonitorEvent(
+                symbol=record["symbol"],
+                timeframe=record.get("timeframe", "1h"),
+                prediction_timestamp=(
+                    pd.to_datetime(record["prediction_timestamp"], utc=True).to_pydatetime()
+                    if record.get("prediction_timestamp") is not None
+                    else None
+                ),
+                observed_accuracy_pct=record.get("observed_accuracy_pct"),
+                observed_mape=record.get("observed_mape"),
+                degradation_streak=int(record.get("degradation_streak", 0)),
+                action=record.get("action", "observed"),
+                model_version=record.get("model_version"),
+                note=record.get("note"),
+            )
+            session.add(event)
+            session.commit()
+            return int(event.id)
+
+    def get_monitor_history(
+        self,
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        limit_rows: int = 100,
+    ) -> pd.DataFrame:
+        from sqlalchemy import desc, select
+
+        with self.engine.connect() as conn:
+            stmt = select(ModelMonitorEvent).order_by(desc(ModelMonitorEvent.created_at)).limit(limit_rows)
+            if symbol:
+                stmt = stmt.where(ModelMonitorEvent.symbol == symbol.upper())
+            if timeframe:
+                stmt = stmt.where(ModelMonitorEvent.timeframe == timeframe)
+            df = pd.read_sql(stmt, conn)
+
+        if df.empty:
+            return df
+
+        if "prediction_timestamp" in df.columns:
+            df["prediction_timestamp"] = pd.to_datetime(df["prediction_timestamp"], utc=True)
+        if "created_at" in df.columns:
+            df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+        return df.sort_values("created_at", ascending=False).reset_index(drop=True)
         
     def _insert_market_data_sqlite(self, df: pd.DataFrame, exchange: Optional[str]):
         """SQLite implementation for inserting market data."""

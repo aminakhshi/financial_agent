@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any, List, Optional
 
+import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -70,6 +71,12 @@ class Sp500BackfillRequest(BaseModel):
     hourly_period: str = "6mo"
     hourly_end: Optional[str] = None
     batch_size: Optional[int] = Field(default=None, ge=1, le=250)
+
+
+class MonitorRequest(BaseModel):
+    symbols: List[str] = Field(default_factory=list)
+    interval: str = "1d"
+    auto_fine_tune: bool = True
 
 
 app = FastAPI(
@@ -285,11 +292,12 @@ def generate_predictions(request: PredictionRequest, agent: Any = Depends(get_au
 @app.get("/predictions/latest")
 def latest_predictions(
     symbol: str = Query(..., min_length=1),
+    interval: Optional[str] = Query(None),
     limit: int = Query(24, ge=1, le=500),
     agent: Any = Depends(get_automation_agent),
 ):
     try:
-        return agent.get_latest_predictions(symbol, limit_rows=limit)
+        return agent.get_latest_predictions(symbol, limit_rows=limit, interval=interval)
     except Exception as exc:
         _handle_service_error(exc)
 
@@ -300,6 +308,7 @@ def evaluate_predictions(
     universe: str = Query("configured"),
     start: Optional[str] = Query(None),
     end: Optional[str] = Query(None),
+    interval: Optional[str] = Query(None),
     limit: int = Query(1000, ge=1, le=100000),
     sync_actuals: bool = Query(True),
     agent: Any = Depends(get_automation_agent),
@@ -310,9 +319,53 @@ def evaluate_predictions(
             universe=universe,
             start=start,
             end=end,
+            interval=interval,
             limit_rows=limit,
             sync_actuals=sync_actuals,
         )
+    except Exception as exc:
+        _handle_service_error(exc)
+
+
+@app.post("/models/monitor")
+def monitor_models(request: MonitorRequest, agent: Any = Depends(get_automation_agent)):
+    try:
+        symbols = request.symbols or agent.default_symbols
+        completed = [
+            agent.monitor_model_health(symbol, interval=request.interval, auto_fine_tune=request.auto_fine_tune)
+            for symbol in symbols
+        ]
+        return {
+            "symbols": symbols,
+            "interval": request.interval,
+            "completed": completed,
+            "message": f"Monitored {len(symbols)} models for interval {request.interval}.",
+        }
+    except Exception as exc:
+        _handle_service_error(exc)
+
+
+@app.get("/models/monitor-history")
+def monitor_history(
+    symbol: Optional[str] = Query(None),
+    interval: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=1000),
+    agent: Any = Depends(get_automation_agent),
+):
+    try:
+        history = agent.db_manager.get_monitor_history(symbol=symbol, timeframe=interval, limit_rows=limit)
+        rows = history.to_dict(orient="records")
+        for row in rows:
+            if row.get("prediction_timestamp") is not None:
+                row["prediction_timestamp"] = pd.to_datetime(row["prediction_timestamp"], utc=True).isoformat()
+            if row.get("created_at") is not None:
+                row["created_at"] = pd.to_datetime(row["created_at"], utc=True).isoformat()
+        return {
+            "symbol": symbol,
+            "interval": interval,
+            "rows": rows,
+            "message": f"Retrieved {len(rows)} monitor events.",
+        }
     except Exception as exc:
         _handle_service_error(exc)
 

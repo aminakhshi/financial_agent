@@ -2,7 +2,6 @@ import asyncio
 import os
 from datetime import datetime, timedelta
 from math import sqrt
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
@@ -187,6 +186,28 @@ class AutomationAgent:
             return latest_timestamp + timedelta(days=int(interval[:-1] or "1"))
         raise ValueError(f"Unsupported interval: {interval}")
 
+    def _default_training_period(self, interval: str) -> str:
+        if interval.endswith("d"):
+            return self.config["MARKET_CONFIG"].get("daily_model_training_period", "10y")
+        return self.config["MARKET_CONFIG"].get("hourly_model_training_period", "6mo")
+
+    def _default_refresh_period(self, interval: str) -> str:
+        if interval.endswith("d"):
+            return self.config["MARKET_CONFIG"].get("daily_prediction_refresh_period", "1y")
+        return self.config["MARKET_CONFIG"].get("hourly_prediction_refresh_period", "5d")
+
+    def _history_limit_for_interval(self, interval: str) -> int:
+        sequence_length = self.ml_predictor.get_sequence_length(interval)
+        if interval.endswith("d"):
+            return max(sequence_length * 8, 252 * 10)
+        return max(sequence_length * 8, int(self.config["MARKET_CONFIG"].get("lookback_days", 365)) * 24)
+
+    def _recent_limit_for_interval(self, interval: str) -> int:
+        sequence_length = self.ml_predictor.get_sequence_length(interval)
+        if interval.endswith("d"):
+            return max(sequence_length + 90, 320)
+        return max(sequence_length + 60, 240)
+
     def _calculate_confidence(self, metadata: Dict[str, Any], current_price: float, predicted_price: float) -> float:
         rmse = metadata.get("test_rmse") or metadata.get("train_rmse")
         if rmse is None or current_price <= 0:
@@ -198,6 +219,35 @@ class AutomationAgent:
         move_ratio = abs(predicted_price - current_price) / max(abs(current_price), 1e-9)
         confidence = baseline - min(15.0, move_ratio * 250.0)
         return round(max(10.0, min(95.0, confidence)), 2)
+
+    def _calibrate_prediction(
+        self,
+        recent_frame: pd.DataFrame,
+        current_price: float,
+        raw_predicted_price: float,
+        interval: str,
+    ) -> Dict[str, float]:
+        raw_change_pct = ((raw_predicted_price - current_price) / current_price) * 100 if current_price else 0.0
+        recent_returns = recent_frame["close"].pct_change().dropna()
+        realized_volatility_pct = float(recent_returns.tail(20).std() * 100.0) if not recent_returns.empty else 1.0
+
+        if interval.endswith("d"):
+            min_cap_pct, max_cap_pct, smoothing = 2.5, 8.0, 0.55
+        else:
+            min_cap_pct, max_cap_pct, smoothing = 1.0, 6.0, 0.65
+
+        cap_pct = min(max_cap_pct, max(min_cap_pct, realized_volatility_pct * 3.0))
+        clipped_change_pct = max(-cap_pct, min(cap_pct, raw_change_pct))
+        calibrated_change_pct = clipped_change_pct * smoothing
+        calibrated_price = current_price * (1.0 + calibrated_change_pct / 100.0)
+
+        return {
+            "raw_predicted_price": float(raw_predicted_price),
+            "raw_predicted_change_pct": round(float(raw_change_pct), 4),
+            "predicted_price": float(calibrated_price),
+            "predicted_change_pct": round(float(calibrated_change_pct), 4),
+            "volatility_cap_pct": round(float(cap_pct), 4),
+        }
 
     def _format_prediction_message(self, prediction: Dict[str, Any]) -> str:
         direction = prediction["direction"]
@@ -361,7 +411,7 @@ class AutomationAgent:
         market_data["exchange"] = market_data["symbol"].map(self.exchange_lookup).fillna("US")
         market_data["timeframe"] = interval
         self.db_manager.insert_market_data(market_data)
-        actuals_updated = self.db_manager.sync_prediction_actuals(symbols)
+        actuals_updated = self.db_manager.sync_prediction_actuals(symbols, timeframe=interval)
         rows_by_symbol = {
             symbol: int(count) for symbol, count in market_data.groupby("symbol").size().to_dict().items()
         }
@@ -496,8 +546,11 @@ class AutomationAgent:
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
         symbol = symbol.upper()
-        min_rows = self.ml_predictor.sequence_length + 24
-        history_limit = max(int(self.config["MARKET_CONFIG"].get("lookback_days", 365)) * 24, min_rows * 2)
+        effective_history_period = (
+            self._default_training_period(interval) if history_period == "6mo" and interval.endswith("d") else history_period
+        )
+        min_rows = self.ml_predictor.get_sequence_length(interval) + 24
+        history_limit = self._history_limit_for_interval(interval)
         market_data = self.db_manager.get_latest_data(
             symbol,
             limit_rows=history_limit,
@@ -506,7 +559,7 @@ class AutomationAgent:
         )
 
         if force_refresh or market_data.empty or len(market_data) < min_rows:
-            self.collect_market_data([symbol], period=history_period, interval=interval)
+            self.collect_market_data([symbol], period=effective_history_period, interval=interval)
             market_data = self.db_manager.get_latest_data(
                 symbol,
                 limit_rows=history_limit,
@@ -519,19 +572,24 @@ class AutomationAgent:
 
         predictor = self._model_factory()
         training_frame = self._normalize_market_frame(market_data)
-        metrics = predictor.train(training_frame, symbol)
+        metrics = predictor.train(training_frame, symbol, interval=interval)
         message = (
-            f"Trained the {symbol} model on {metrics['training_rows']} hourly rows. "
-            f"Test RMSE is {metrics['test_rmse']:.4f}."
+            f"Trained the {symbol} {interval} model on {metrics['training_rows']} rows. "
+            f"Test accuracy is {metrics.get('test_accuracy_pct', 0.0):.2f}%."
         )
         logger.info(message)
         return {
             "symbol": symbol,
+            "interval": interval,
             "training_rows": metrics["training_rows"],
             "train_rmse": metrics["train_rmse"],
             "test_rmse": metrics["test_rmse"],
             "train_mae": metrics["train_mae"],
             "test_mae": metrics["test_mae"],
+            "train_mape": metrics.get("train_mape"),
+            "test_mape": metrics.get("test_mape"),
+            "test_accuracy_pct": metrics.get("test_accuracy_pct"),
+            "directional_accuracy_pct": metrics.get("directional_accuracy_pct"),
             "model_version": metrics["model_version"],
             "trained_at": metrics["trained_at"],
             "message": message,
@@ -569,6 +627,141 @@ class AutomationAgent:
             "timestamp": datetime.utcnow().isoformat(),
         }
 
+    def monitor_model_health(
+        self,
+        symbol: str,
+        interval: str = "1d",
+        auto_fine_tune: bool = True,
+    ) -> Dict[str, Any]:
+        symbol = symbol.upper()
+        predictor = self._model_factory()
+        settings = predictor.get_interval_settings(interval)
+        if not predictor.has_model(symbol, interval):
+            return {
+                "symbol": symbol,
+                "interval": interval,
+                "action": "skipped",
+                "degradation_streak": 0,
+                "message": "No trained model is available yet for monitoring.",
+            }
+
+        self.db_manager.sync_prediction_actuals([symbol], timeframe=interval)
+        history = self.db_manager.get_prediction_history(
+            symbols=[symbol],
+            timeframe=interval,
+            limit_rows=int(self.config["MODEL_CONFIG"].get("monitoring", {}).get("lookback_evaluations", 12)),
+            ascending=False,
+            only_evaluated=True,
+        )
+        if history.empty:
+            return {
+                "symbol": symbol,
+                "interval": interval,
+                "action": "skipped",
+                "degradation_streak": 0,
+                "message": "No evaluated predictions are available for monitoring.",
+            }
+
+        history = history.sort_values("prediction_timestamp", ascending=False).reset_index(drop=True)
+        history["absolute_percentage_error"] = (
+            (history["predicted_price"] - history["actual_price"]).abs()
+            / history["actual_price"].abs().replace(0, pd.NA)
+        ) * 100.0
+        history["accuracy_pct"] = 100.0 - history["absolute_percentage_error"]
+
+        metadata = predictor.load_metadata(symbol, interval)
+        baseline_accuracy = metadata.get("monitoring_baseline_accuracy_pct") or metadata.get("test_accuracy_pct")
+        accuracy_floor = float(settings["accuracy_floor_pct"])
+        allowed_drop = float(settings["allowed_accuracy_drop_pct"])
+        threshold = accuracy_floor if baseline_accuracy is None else min(float(baseline_accuracy) - allowed_drop, accuracy_floor)
+
+        degradation_streak = 0
+        for _, row in history.iterrows():
+            accuracy_pct = row.get("accuracy_pct")
+            if pd.isna(accuracy_pct) or float(accuracy_pct) >= threshold:
+                break
+            degradation_streak += 1
+
+        latest_row = history.iloc[0]
+        latest_accuracy = None if pd.isna(latest_row["accuracy_pct"]) else float(latest_row["accuracy_pct"])
+        latest_mape = None if pd.isna(latest_row["absolute_percentage_error"]) else float(latest_row["absolute_percentage_error"])
+        action = "observed"
+        note = (
+            f"Threshold {threshold:.2f}%, latest accuracy {latest_accuracy:.2f}%."
+            if latest_accuracy is not None
+            else f"Threshold {threshold:.2f}%."
+        )
+
+        cooldown_predictions = int(self.config["MODEL_CONFIG"].get("monitoring", {}).get("cooldown_predictions", 2))
+        last_monitor_streak = int(metadata.get("last_monitor_streak", 0))
+        recent_monitor_events = self.db_manager.get_monitor_history(
+            symbol=symbol,
+            timeframe=interval,
+            limit_rows=cooldown_predictions,
+        )
+        recently_fine_tuned = (
+            not recent_monitor_events.empty
+            and (recent_monitor_events["action"] == "fine_tuned").any()
+        )
+        can_fine_tune = (
+            auto_fine_tune
+            and degradation_streak >= int(settings["consecutive_drop_limit"])
+            and degradation_streak > last_monitor_streak
+            and not recently_fine_tuned
+        )
+
+        if can_fine_tune:
+            market_data = self.db_manager.get_latest_data(
+                symbol,
+                limit_rows=self._history_limit_for_interval(interval),
+                timeframe=interval,
+                ascending=True,
+            )
+            training_frame = self._normalize_market_frame(market_data)
+            tune_metrics = predictor.fine_tune(training_frame, symbol, interval=interval)
+            action = "fine_tuned"
+            note = (
+                f"Fine-tuned after {degradation_streak} consecutive weak evaluations. "
+                f"Updated accuracy target is {tune_metrics.get('test_accuracy_pct', 0.0):.2f}%."
+            )
+            metadata = predictor.load_metadata(symbol, interval)
+            metadata["last_monitor_streak"] = 0
+            metadata["last_monitor_accuracy_pct"] = latest_accuracy
+            predictor.save_metadata(symbol, interval, metadata)
+        else:
+            if degradation_streak >= int(settings["consecutive_drop_limit"]):
+                action = "cooldown"
+            metadata["last_monitor_streak"] = degradation_streak
+            metadata["last_monitor_accuracy_pct"] = latest_accuracy
+            predictor.save_metadata(symbol, interval, metadata)
+
+        self.db_manager.insert_monitor_event(
+            {
+                "symbol": symbol,
+                "timeframe": interval,
+                "prediction_timestamp": latest_row["prediction_timestamp"],
+                "observed_accuracy_pct": latest_accuracy,
+                "observed_mape": latest_mape,
+                "degradation_streak": degradation_streak,
+                "action": action,
+                "model_version": metadata.get("model_version"),
+                "note": note,
+            }
+        )
+
+        if action == "cooldown" and degradation_streak <= cooldown_predictions:
+            action = "observed"
+
+        return {
+            "symbol": symbol,
+            "interval": interval,
+            "action": action,
+            "degradation_streak": degradation_streak,
+            "latest_accuracy_pct": latest_accuracy,
+            "threshold_accuracy_pct": round(threshold, 6),
+            "message": note,
+        }
+
     def generate_prediction(
         self,
         symbol: str,
@@ -578,10 +771,13 @@ class AutomationAgent:
         auto_train: bool = True,
     ) -> Dict[str, Any]:
         symbol = symbol.upper()
-        recent_limit = max(self.ml_predictor.sequence_length + 50, 200)
+        effective_refresh_period = (
+            self._default_refresh_period(interval) if refresh_period == "5d" and interval.endswith("d") else refresh_period
+        )
+        recent_limit = self._recent_limit_for_interval(interval)
 
         if force_refresh:
-            self.collect_market_data([symbol], period=refresh_period, interval=interval)
+            self.collect_market_data([symbol], period=effective_refresh_period, interval=interval)
 
         market_data = self.db_manager.get_latest_data(
             symbol,
@@ -589,8 +785,9 @@ class AutomationAgent:
             timeframe=interval,
             ascending=True,
         )
-        if market_data.empty or len(market_data) < self.ml_predictor.sequence_length + 5:
-            self.collect_market_data([symbol], period=refresh_period, interval=interval)
+        required_rows = self.ml_predictor.get_sequence_length(interval) + 5
+        if market_data.empty or len(market_data) < required_rows:
+            self.collect_market_data([symbol], period=effective_refresh_period, interval=interval)
             market_data = self.db_manager.get_latest_data(
                 symbol,
                 limit_rows=recent_limit,
@@ -601,20 +798,33 @@ class AutomationAgent:
         if market_data.empty:
             raise ValueError(f"No market data is available for {symbol}.")
 
-        model_path = Path(f"models/saved/{symbol}/lstm_model.h5")
-        if not model_path.exists():
+        predictor = self._model_factory()
+        if not predictor.has_model(symbol, interval):
             if not auto_train:
                 raise FileNotFoundError(f"No trained model is available for {symbol}.")
-            self.train_model(symbol, history_period="6mo", interval=interval, force_refresh=False)
+            self.train_model(
+                symbol,
+                history_period=self._default_training_period(interval),
+                interval=interval,
+                force_refresh=False,
+            )
 
-        predictor = self._model_factory()
-        predictor.load_model(symbol)
-        metadata = predictor.load_metadata(symbol)
+        monitoring = self.monitor_model_health(symbol, interval=interval, auto_fine_tune=auto_train)
+
+        predictor.load_model(symbol, interval)
+        metadata = predictor.load_metadata(symbol, interval)
         recent_frame = self._normalize_market_frame(market_data)
 
         current_price = float(recent_frame["close"].iloc[-1])
-        predicted_price = float(predictor.predict(recent_frame))
-        predicted_change_pct = ((predicted_price - current_price) / current_price) * 100 if current_price else 0.0
+        raw_predicted_price = float(predictor.predict(recent_frame, interval=interval))
+        calibrated_prediction = self._calibrate_prediction(
+            recent_frame=recent_frame,
+            current_price=current_price,
+            raw_predicted_price=raw_predicted_price,
+            interval=interval,
+        )
+        predicted_price = calibrated_prediction["predicted_price"]
+        predicted_change_pct = calibrated_prediction["predicted_change_pct"]
         prediction_timestamp = self._next_prediction_timestamp(recent_frame["timestamp"].iloc[-1], interval)
         confidence_score = self._calculate_confidence(metadata, current_price, predicted_price)
         direction = "up" if predicted_price > current_price else "down" if predicted_price < current_price else "flat"
@@ -622,13 +832,14 @@ class AutomationAgent:
 
         record = {
             "symbol": symbol,
+            "timeframe": interval,
             "prediction_timestamp": prediction_timestamp,
             "predicted_price": predicted_price,
             "confidence_score": confidence_score,
             "model_version": model_version,
         }
         self.db_manager.upsert_prediction_results([record])
-        self.db_manager.sync_prediction_actuals([symbol])
+        self.db_manager.sync_prediction_actuals([symbol], timeframe=interval)
 
         response = {
             "symbol": symbol,
@@ -637,9 +848,13 @@ class AutomationAgent:
             "current_price": current_price,
             "predicted_price": predicted_price,
             "predicted_change_pct": round(predicted_change_pct, 4),
+            "raw_predicted_price": calibrated_prediction["raw_predicted_price"],
+            "raw_predicted_change_pct": calibrated_prediction["raw_predicted_change_pct"],
+            "volatility_cap_pct": calibrated_prediction["volatility_cap_pct"],
             "direction": direction,
             "confidence_score": confidence_score,
             "model_version": model_version,
+            "monitoring": monitoring,
         }
         response["message"] = self._format_prediction_message(response)
         logger.info(response["message"])
@@ -679,12 +894,18 @@ class AutomationAgent:
             "timestamp": datetime.utcnow().isoformat(),
         }
 
-    def get_latest_predictions(self, symbol: str, limit_rows: int = 24) -> Dict[str, Any]:
+    def get_latest_predictions(self, symbol: str, limit_rows: int = 24, interval: Optional[str] = None) -> Dict[str, Any]:
         symbol = symbol.upper()
-        predictions = self.db_manager.get_latest_predictions(symbol, limit_rows=limit_rows, ascending=False)
+        predictions = self.db_manager.get_latest_predictions(
+            symbol,
+            limit_rows=limit_rows,
+            timeframe=interval,
+            ascending=False,
+        )
         if predictions.empty:
             return {
                 "symbol": symbol,
+                "interval": interval,
                 "predictions": [],
                 "message": f"No prediction history is available for {symbol}.",
             }
@@ -698,6 +919,7 @@ class AutomationAgent:
             rows.append(cleaned)
         return {
             "symbol": symbol,
+            "interval": interval,
             "predictions": rows,
             "message": f"Retrieved {len(rows)} prediction rows for {symbol}.",
         }
@@ -747,6 +969,7 @@ class AutomationAgent:
         universe: str = "configured",
         start: Optional[str] = None,
         end: Optional[str] = None,
+        interval: Optional[str] = None,
         limit_rows: int = 1000,
         sync_actuals: bool = True,
     ) -> Dict[str, Any]:
@@ -755,12 +978,13 @@ class AutomationAgent:
         if symbols or normalized_universe not in {"", "database", "stored"}:
             resolved_symbols = self._resolve_market_universe(universe=universe, symbols=symbols)
         if sync_actuals:
-            self.db_manager.sync_prediction_actuals(resolved_symbols)
+            self.db_manager.sync_prediction_actuals(resolved_symbols, timeframe=interval)
 
         prediction_history = self.db_manager.get_prediction_history(
             symbols=resolved_symbols,
             start=start,
             end=end,
+            timeframe=interval,
             limit_rows=limit_rows,
             ascending=False,
             only_evaluated=False,
@@ -770,6 +994,7 @@ class AutomationAgent:
             return {
                 "symbols": resolved_symbols or [],
                 "universe": None if symbols else (universe or None),
+                "interval": interval,
                 "prediction_count": 0,
                 "evaluated_count": 0,
                 "pending_actual_count": 0,
@@ -834,6 +1059,7 @@ class AutomationAgent:
         return {
             "symbols": sorted({str(symbol).upper() for symbol in prediction_history["symbol"].tolist()}),
             "universe": None if symbols else (universe or None),
+            "interval": interval,
             "prediction_count": int(len(prediction_history)),
             "evaluated_count": int(len(evaluated)),
             "pending_actual_count": pending_count,
@@ -863,7 +1089,7 @@ class AutomationAgent:
             exchange=exchange,
             timeframe=timeframe,
         )
-        prediction_coverage = self.db_manager.get_prediction_coverage(symbols=resolved_symbols)
+        prediction_coverage = self.db_manager.get_prediction_coverage(symbols=resolved_symbols, timeframe=timeframe)
 
         target_symbols = resolved_symbols or sorted(
             set(market_coverage["symbol"].tolist()) | set(prediction_coverage["symbol"].tolist())
@@ -911,6 +1137,7 @@ class AutomationAgent:
             "prediction_coverage": [
                 {
                     "symbol": row["symbol"],
+                    "timeframe": row.get("timeframe"),
                     "prediction_count": int(row["prediction_count"]),
                     "evaluated_count": int(row["evaluated_count"]),
                     "pending_actual_count": int(row["pending_actual_count"]),
@@ -974,7 +1201,12 @@ class AutomationAgent:
                 continue
 
             recent_frame = self._normalize_market_frame(market_data)
-            latest_predictions = self.db_manager.get_latest_predictions(symbol, limit_rows=1, ascending=False)
+            latest_predictions = self.db_manager.get_latest_predictions(
+                symbol,
+                limit_rows=1,
+                timeframe=interval,
+                ascending=False,
+            )
             latest_market_timestamp = recent_frame["timestamp"].iloc[-1]
 
             if auto_predict:
@@ -997,6 +1229,7 @@ class AutomationAgent:
                         latest_predictions = self.db_manager.get_latest_predictions(
                             symbol,
                             limit_rows=1,
+                            timeframe=interval,
                             ascending=False,
                         )
                         prediction_error = None

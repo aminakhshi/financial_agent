@@ -29,7 +29,15 @@ This pipeline uses LLM agents to collect financial market data, train DNN models
 
 ## Documentation
 
-See the implementation guide for detailed setup and usage instructions.
+Structured ReadTheDocs-style documentation is available under `docs/`.
+
+- Main index: `docs/index.rst`
+- API usage: `docs/api.rst`
+- Runtime modes: `docs/run-modes.rst`
+- Dashboard and visualization: `docs/dashboard.rst`
+- Data storage and inspection: `docs/data-storage.rst`
+- OpenClaw integration: `docs/openclaw.rst`
+- Read the Docs publishing: `docs/readthedocs.rst`
 
 ## API Services
 
