@@ -1,15 +1,18 @@
+import os
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+import hashlib
+import json
+
+import joblib
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import hashlib
-import json
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-import joblib
-import os
+from tensorflow.keras.layers import Dense, Dropout, Input, LSTM
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.optimizers import Adam
 
 class LSTMPredictor:
     def __init__(self, config):
@@ -76,7 +79,8 @@ class LSTMPredictor:
     def build_model(self, input_shape):
         """Build LSTM model"""
         model = Sequential([
-            LSTM(50, return_sequences=True, input_shape=input_shape),
+            Input(shape=input_shape),
+            LSTM(50, return_sequences=True),
             Dropout(0.2),
             LSTM(50, return_sequences=True),
             Dropout(0.2), 

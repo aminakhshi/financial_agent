@@ -2,6 +2,8 @@ import os
 from dotenv import load_dotenv
 from pathlib import Path
 
+from data.symbol_universe import load_sp500_symbols
+
 load_dotenv()
 
 
@@ -11,8 +13,44 @@ def get_required_env(name):
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
 
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def has_explicit_database_url() -> bool:
+    return bool(os.environ.get("DB_URL", "").strip() or os.environ.get("DATABASE_URL", "").strip())
+
+
+def has_explicit_db_config() -> bool:
+    return any(
+        os.environ.get(name, "").strip()
+        for name in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD")
+    )
+
+
+def should_use_database_config() -> bool:
+    return not has_explicit_database_url() and has_explicit_db_config()
+
+
+def sqlite_fallback_enabled(default: bool = True) -> bool:
+    return env_flag("ENABLE_SQLITE_FALLBACK", default=default)
+
 # Base directory
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
+FULL_SP500_SYMBOLS = load_sp500_symbols(BASE_DIR)
+DEFAULT_SYMBOLS = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'TSLA']
+FALLBACK_SP500_SYMBOLS = [
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK-B',
+    'UNH', 'JNJ', 'JPM', 'V', 'PG', 'XOM', 'HD', 'CVX', 'MA', 'ABBV',
+    'PFE', 'AVGO', 'COST', 'DIS', 'KO', 'MRK', 'PEP', 'TMO', 'WMT',
+    'ABT', 'BAC', 'CRM', 'CSCO', 'ACN', 'LIN', 'ADBE', 'MCD', 'VZ',
+    'DHR', 'NFLX', 'CMCSA', 'NKE', 'TXN', 'NEE', 'AMD', 'PM', 'RTX',
+    'UPS', 'T', 'LOW',
+]
 
 # API Keys - load from environment variables
 API_KEY_ALPHAVANTAGE = os.environ.get("API_KEY_ALPHAVANTAGE", "")
@@ -56,14 +94,8 @@ LLM_CONFIG = {
 
 # Market data configuration
 MARKET_CONFIG = {
-    'sp500_symbols': [
-        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK-B',
-        'UNH', 'JNJ', 'JPM', 'V', 'PG', 'XOM', 'HD', 'CVX', 'MA', 'ABBV',
-        'PFE', 'AVGO', 'COST', 'DIS', 'KO', 'MRK', 'PEP', 'TMO', 'WMT',
-        'ABT', 'BAC', 'CRM', 'CSCO', 'ACN', 'LIN', 'ADBE', 'MCD', 'VZ',
-        'DHR', 'NFLX', 'CMCSA', 'NKE', 'TXN', 'NEE', 'AMD', 'PM', 'RTX',
-        'UPS', 'T', 'LOW'  # Top 50 index symbols
-    ],
+    'default_symbols': DEFAULT_SYMBOLS,
+    'sp500_symbols': FULL_SP500_SYMBOLS or FALLBACK_SP500_SYMBOLS,
     'nasdaq_symbols': [
         'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'NVDA', 'TSLA', 'META',
         'AVGO', 'COST', 'NFLX', 'ADBE', 'PEP', 'CSCO', 'TMUS', 'AMD',
@@ -72,7 +104,10 @@ MARKET_CONFIG = {
         'REGN', 'KLAC', 'PYPL', 'ATVI', 'MRVL', 'ORLY', 'CSX', 'FTNT'
     ],
     'update_frequency': 'hourly',
-    'lookback_days': 365
+    'lookback_days': 365,
+    'sp500_daily_backfill_start': '1991-01-01',
+    'sp500_hourly_backfill_period': '6mo',
+    'download_batch_size': int(os.getenv('DOWNLOAD_BATCH_SIZE', '25')),
 }
 
 # Model training configuration

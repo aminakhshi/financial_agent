@@ -32,7 +32,8 @@ class AutomationAgent:
         self.data_collector = data_collector
         self.ml_predictor = ml_predictor
         self.crewai_enabled = os.getenv("DISABLE_CREWAI", "false").strip().lower() != "true"
-        self.default_symbols = self._resolve_symbols(self.DEFAULT_SYMBOLS)
+        configured_defaults = self.config["MARKET_CONFIG"].get("default_symbols", self.DEFAULT_SYMBOLS)
+        self.default_symbols = self._resolve_symbols(configured_defaults)
         self.exchange_lookup = self._build_exchange_lookup()
         self.llm = self._build_llm()
 
@@ -143,6 +144,7 @@ class AutomationAgent:
             "watchlist": self.default_symbols,
             "sp500": configured_sp500,
             "s&p500": configured_sp500,
+            "sp500_full": configured_sp500,
             "nasdaq": configured_nasdaq,
             "all": configured_sp500 + configured_nasdaq,
             "configured": configured_sp500 + configured_nasdaq,
@@ -328,16 +330,28 @@ class AutomationAgent:
         symbols: Optional[Iterable[str]] = None,
         period: str = "5d",
         interval: str = "1h",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         symbols = self._resolve_symbols(symbols)
-        logger.info(f"Collecting {interval} market data for {', '.join(symbols)} using period {period}.")
+        range_label = f"start={start}, end={end or 'latest'}" if start or end else f"period {period}"
+        logger.info(f"Collecting {interval} market data for {', '.join(symbols)} using {range_label}.")
 
-        market_data = self.data_collector.fetch_yfinance_data(symbols, period=period, interval=interval)
+        market_data = self.data_collector.fetch_yfinance_data(
+            symbols,
+            period=period,
+            interval=interval,
+            start=start,
+            end=end,
+            batch_size=batch_size,
+        )
         if market_data.empty:
             return {
                 "status": "no_data",
                 "symbols": symbols,
                 "rows_collected": 0,
+                "timeframe": interval,
                 "message": "No market data was returned by the provider.",
                 "timestamp": datetime.utcnow().isoformat(),
             }
@@ -345,6 +359,7 @@ class AutomationAgent:
         market_data = market_data.copy()
         market_data["symbol"] = market_data["symbol"].astype(str).str.upper()
         market_data["exchange"] = market_data["symbol"].map(self.exchange_lookup).fillna("US")
+        market_data["timeframe"] = interval
         self.db_manager.insert_market_data(market_data)
         actuals_updated = self.db_manager.sync_prediction_actuals(symbols)
         rows_by_symbol = {
@@ -360,6 +375,8 @@ class AutomationAgent:
             "symbols": symbols,
             "period": period,
             "interval": interval,
+            "start": start,
+            "end": end,
             "rows_collected": int(len(market_data)),
             "rows_by_symbol": rows_by_symbol,
             "actuals_updated": int(actuals_updated),
@@ -373,9 +390,19 @@ class AutomationAgent:
         period: str = "1mo",
         interval: str = "1h",
         symbols: Optional[Iterable[str]] = None,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         resolved_symbols = self._resolve_market_universe(universe=universe, symbols=symbols)
-        result = self.collect_market_data(resolved_symbols, period=period, interval=interval)
+        result = self.collect_market_data(
+            resolved_symbols,
+            period=period,
+            interval=interval,
+            start=start,
+            end=end,
+            batch_size=batch_size,
+        )
         result["universe"] = (universe or "custom").strip().lower()
         result["requested_symbol_count"] = len(resolved_symbols)
         result["stored_symbol_count"] = len(result.get("rows_by_symbol", {}))
@@ -385,6 +412,81 @@ class AutomationAgent:
             f"Updated {result['actuals_updated']} prediction records with realized prices."
         )
         return result
+
+    def backfill_daily_history(
+        self,
+        universe: str = "sp500",
+        symbols: Optional[Iterable[str]] = None,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        batch_size: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        start = start or self.config["MARKET_CONFIG"].get("sp500_daily_backfill_start", "1991-01-01")
+        result = self.collect_market_universe(
+            universe=universe,
+            symbols=symbols,
+            interval="1d",
+            start=start,
+            end=end,
+            batch_size=batch_size,
+        )
+        result["backfill_type"] = "daily"
+        result["message"] = (
+            f"Stored daily backfill rows from {start} through {end or 'latest'} for "
+            f"{result['stored_symbol_count']} symbols."
+        )
+        return result
+
+    def backfill_hourly_history(
+        self,
+        universe: str = "sp500",
+        symbols: Optional[Iterable[str]] = None,
+        period: Optional[str] = None,
+        end: Optional[str] = None,
+        batch_size: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        period = period or self.config["MARKET_CONFIG"].get("sp500_hourly_backfill_period", "6mo")
+        result = self.collect_market_universe(
+            universe=universe,
+            symbols=symbols,
+            period=period,
+            interval="1h",
+            end=end,
+            batch_size=batch_size,
+        )
+        result["backfill_type"] = "hourly"
+        result["message"] = (
+            f"Stored hourly backfill rows for the last {period} for {result['stored_symbol_count']} symbols."
+        )
+        return result
+
+    def backfill_sp500_history(
+        self,
+        daily_start: Optional[str] = None,
+        daily_end: Optional[str] = None,
+        hourly_period: Optional[str] = None,
+        hourly_end: Optional[str] = None,
+        batch_size: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        daily = self.backfill_daily_history(
+            universe="sp500",
+            start=daily_start,
+            end=daily_end,
+            batch_size=batch_size,
+        )
+        hourly = self.backfill_hourly_history(
+            universe="sp500",
+            period=hourly_period,
+            end=hourly_end,
+            batch_size=batch_size,
+        )
+        return {
+            "universe": "sp500",
+            "daily": daily,
+            "hourly": hourly,
+            "message": "Completed S&P 500 daily and hourly history backfills.",
+            "timestamp": datetime.utcnow().isoformat(),
+        }
 
     def train_model(
         self,
@@ -396,11 +498,21 @@ class AutomationAgent:
         symbol = symbol.upper()
         min_rows = self.ml_predictor.sequence_length + 24
         history_limit = max(int(self.config["MARKET_CONFIG"].get("lookback_days", 365)) * 24, min_rows * 2)
-        market_data = self.db_manager.get_latest_data(symbol, limit_rows=history_limit, ascending=True)
+        market_data = self.db_manager.get_latest_data(
+            symbol,
+            limit_rows=history_limit,
+            timeframe=interval,
+            ascending=True,
+        )
 
         if force_refresh or market_data.empty or len(market_data) < min_rows:
             self.collect_market_data([symbol], period=history_period, interval=interval)
-            market_data = self.db_manager.get_latest_data(symbol, limit_rows=history_limit, ascending=True)
+            market_data = self.db_manager.get_latest_data(
+                symbol,
+                limit_rows=history_limit,
+                timeframe=interval,
+                ascending=True,
+            )
 
         if market_data.empty or len(market_data) < min_rows:
             raise ValueError(f"Not enough market history is available to train {symbol}.")
@@ -471,10 +583,20 @@ class AutomationAgent:
         if force_refresh:
             self.collect_market_data([symbol], period=refresh_period, interval=interval)
 
-        market_data = self.db_manager.get_latest_data(symbol, limit_rows=recent_limit, ascending=True)
+        market_data = self.db_manager.get_latest_data(
+            symbol,
+            limit_rows=recent_limit,
+            timeframe=interval,
+            ascending=True,
+        )
         if market_data.empty or len(market_data) < self.ml_predictor.sequence_length + 5:
             self.collect_market_data([symbol], period=refresh_period, interval=interval)
-            market_data = self.db_manager.get_latest_data(symbol, limit_rows=recent_limit, ascending=True)
+            market_data = self.db_manager.get_latest_data(
+                symbol,
+                limit_rows=recent_limit,
+                timeframe=interval,
+                ascending=True,
+            )
 
         if market_data.empty:
             raise ValueError(f"No market data is available for {symbol}.")
@@ -587,6 +709,7 @@ class AutomationAgent:
         start: Optional[str] = None,
         end: Optional[str] = None,
         exchange: Optional[str] = None,
+        timeframe: Optional[str] = None,
         limit_rows: int = 1000,
         ascending: bool = False,
     ) -> Dict[str, Any]:
@@ -599,6 +722,7 @@ class AutomationAgent:
             start=start,
             end=end,
             exchange=exchange,
+            timeframe=timeframe,
             limit_rows=limit_rows,
             ascending=ascending,
         )
@@ -722,6 +846,89 @@ class AutomationAgent:
             ),
         }
 
+    def get_data_coverage(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        universe: str = "configured",
+        exchange: Optional[str] = None,
+        timeframe: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        normalized_universe = (universe or "").strip().lower()
+        resolved_symbols = None
+        if symbols or normalized_universe not in {"", "database", "stored"}:
+            resolved_symbols = self._resolve_market_universe(universe=universe, symbols=symbols)
+
+        market_coverage = self.db_manager.get_market_coverage(
+            symbols=resolved_symbols,
+            exchange=exchange,
+            timeframe=timeframe,
+        )
+        prediction_coverage = self.db_manager.get_prediction_coverage(symbols=resolved_symbols)
+
+        target_symbols = resolved_symbols or sorted(
+            set(market_coverage["symbol"].tolist()) | set(prediction_coverage["symbol"].tolist())
+        )
+        stored_market_symbols = sorted(set(market_coverage["symbol"].tolist())) if not market_coverage.empty else []
+        stored_prediction_symbols = (
+            sorted(set(prediction_coverage["symbol"].tolist())) if not prediction_coverage.empty else []
+        )
+
+        timeframe_summary = []
+        if not market_coverage.empty:
+            for current_timeframe, group in market_coverage.groupby("timeframe"):
+                timeframe_summary.append(
+                    {
+                        "timeframe": current_timeframe,
+                        "row_count": int(group["row_count"].sum()),
+                        "symbol_count": int(group["symbol"].nunique()),
+                        "first_timestamp": group["first_timestamp"].min().isoformat(),
+                        "last_timestamp": group["last_timestamp"].max().isoformat(),
+                    }
+                )
+
+        return {
+            "symbols": target_symbols,
+            "universe": None if symbols else (universe or None),
+            "requested_symbol_count": len(target_symbols),
+            "market_symbol_count": len(stored_market_symbols),
+            "prediction_symbol_count": len(stored_prediction_symbols),
+            "symbols_without_market_data": [symbol for symbol in target_symbols if symbol not in stored_market_symbols],
+            "symbols_without_predictions": [
+                symbol for symbol in target_symbols if symbol not in stored_prediction_symbols
+            ],
+            "timeframe_summary": timeframe_summary,
+            "market_coverage": [
+                {
+                    "symbol": row["symbol"],
+                    "exchange": row["exchange"],
+                    "timeframe": row["timeframe"],
+                    "row_count": int(row["row_count"]),
+                    "first_timestamp": pd.to_datetime(row["first_timestamp"], utc=True).isoformat(),
+                    "last_timestamp": pd.to_datetime(row["last_timestamp"], utc=True).isoformat(),
+                }
+                for row in market_coverage.to_dict(orient="records")
+            ],
+            "prediction_coverage": [
+                {
+                    "symbol": row["symbol"],
+                    "prediction_count": int(row["prediction_count"]),
+                    "evaluated_count": int(row["evaluated_count"]),
+                    "pending_actual_count": int(row["pending_actual_count"]),
+                    "coverage_pct": round(float(row["coverage_pct"]), 4),
+                    "first_prediction_timestamp": pd.to_datetime(
+                        row["first_prediction_timestamp"],
+                        utc=True,
+                    ).isoformat(),
+                    "last_prediction_timestamp": pd.to_datetime(
+                        row["last_prediction_timestamp"],
+                        utc=True,
+                    ).isoformat(),
+                }
+                for row in prediction_coverage.to_dict(orient="records")
+            ],
+            "message": "Retrieved market and prediction coverage from SQL storage.",
+        }
+
     def build_market_report(
         self,
         symbols: Optional[Iterable[str]] = None,
@@ -735,7 +942,12 @@ class AutomationAgent:
         items: List[Dict[str, Any]] = []
 
         for symbol in symbols:
-            market_data = self.db_manager.get_latest_data(symbol, limit_rows=48, ascending=True)
+            market_data = self.db_manager.get_latest_data(
+                symbol,
+                limit_rows=48,
+                timeframe=interval,
+                ascending=True,
+            )
             prediction_payload: Optional[Dict[str, Any]] = None
             prediction_error: Optional[str] = None
 
@@ -751,7 +963,12 @@ class AutomationAgent:
                 except Exception as exc:
                     prediction_error = str(exc)
                     logger.error(f"Prediction refresh failed for {symbol} during report generation: {exc}")
-                market_data = self.db_manager.get_latest_data(symbol, limit_rows=48, ascending=True)
+                market_data = self.db_manager.get_latest_data(
+                    symbol,
+                    limit_rows=48,
+                    timeframe=interval,
+                    ascending=True,
+                )
 
             if market_data.empty:
                 continue

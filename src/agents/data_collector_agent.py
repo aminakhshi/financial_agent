@@ -6,6 +6,7 @@ import asyncio
 import schedule
 import time
 import os
+from typing import Iterable, List, Optional
 
 try:
     from langchain.llms.base import LLM as BaseLLM
@@ -126,26 +127,152 @@ class DataCollectorAgent:
             verbose=True
         )
     
-    def fetch_yfinance_data(self, symbols, period="1d", interval="1h"):
-        """Fetch hourly data using yfinance"""
-        all_data = []
-        
+    def _normalize_symbols(self, symbols: Iterable[str]) -> List[str]:
+        seen = set()
+        normalized: List[str] = []
         for symbol in symbols:
+            cleaned = str(symbol).strip().upper()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            normalized.append(cleaned)
+        return normalized
+
+    def _history_request_kwargs(
+        self,
+        period: Optional[str],
+        interval: str,
+        start: Optional[str],
+        end: Optional[str],
+    ) -> dict:
+        kwargs = {
+            "interval": interval,
+            "auto_adjust": False,
+            "actions": False,
+        }
+        if start or end:
+            kwargs["start"] = start
+            if end:
+                kwargs["end"] = end
+        else:
+            kwargs["period"] = period or "1mo"
+        return kwargs
+
+    def _format_history_frame(self, data: pd.DataFrame, symbol: str, interval: str) -> pd.DataFrame:
+        if data is None or data.empty:
+            return pd.DataFrame()
+
+        frame = data.copy().reset_index()
+        timestamp_column = None
+        for candidate in ("Datetime", "Date"):
+            if candidate in frame.columns:
+                timestamp_column = candidate
+                break
+        if timestamp_column is None:
+            timestamp_column = frame.columns[0]
+
+        rename_map = {
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+        }
+        frame = frame.rename(columns=rename_map)
+        required = {"open", "high", "low", "close", "volume"}
+        if not required.issubset(frame.columns):
+            return pd.DataFrame()
+
+        frame["symbol"] = symbol
+        frame["timestamp"] = pd.to_datetime(frame[timestamp_column], utc=True)
+        frame["timeframe"] = interval
+        return frame[["symbol", "timestamp", "open", "high", "low", "close", "volume", "timeframe"]]
+
+    def _download_batch(
+        self,
+        batch: List[str],
+        period: Optional[str],
+        interval: str,
+        start: Optional[str],
+        end: Optional[str],
+    ) -> pd.DataFrame:
+        kwargs = self._history_request_kwargs(period=period, interval=interval, start=start, end=end)
+        return yf.download(
+            tickers=batch,
+            group_by="ticker",
+            progress=False,
+            threads=True,
+            **kwargs,
+        )
+
+    def _fetch_single_symbol(
+        self,
+        symbol: str,
+        period: Optional[str],
+        interval: str,
+        start: Optional[str],
+        end: Optional[str],
+    ) -> pd.DataFrame:
+        kwargs = self._history_request_kwargs(period=period, interval=interval, start=start, end=end)
+        data = yf.Ticker(symbol).history(**kwargs)
+        return self._format_history_frame(data, symbol, interval)
+
+    def fetch_yfinance_data(
+        self,
+        symbols,
+        period="1d",
+        interval="1h",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        batch_size: Optional[int] = None,
+    ):
+        """Fetch market data using batched yfinance downloads."""
+        normalized_symbols = self._normalize_symbols(symbols)
+        if not normalized_symbols:
+            return pd.DataFrame()
+
+        batch_size = max(int(batch_size or self.config["MARKET_CONFIG"].get("download_batch_size", 25)), 1)
+        all_data = []
+
+        for index in range(0, len(normalized_symbols), batch_size):
+            batch = normalized_symbols[index:index + batch_size]
             try:
-                ticker = yf.Ticker(symbol)
-                data = ticker.history(period=period, interval=interval)
-                
-                if not data.empty:
-                    data = data.reset_index()
-                    data['symbol'] = symbol
-                    data['timestamp'] = data['Datetime']
-                    data = data[['symbol', 'timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']]
-                    data.columns = ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume']
-                    all_data.append(data)
-                    
-            except Exception as e:
-                print(f"Error fetching data for {symbol}: {e}")
-                
+                data = self._download_batch(batch, period=period, interval=interval, start=start, end=end)
+                if isinstance(data.columns, pd.MultiIndex):
+                    available_symbols = set(data.columns.get_level_values(0))
+                    for symbol in batch:
+                        if symbol not in available_symbols:
+                            continue
+                        formatted = self._format_history_frame(data[symbol], symbol, interval)
+                        if not formatted.empty:
+                            all_data.append(formatted)
+                else:
+                    symbol = batch[0]
+                    formatted = self._format_history_frame(data, symbol, interval)
+                    if not formatted.empty:
+                        all_data.append(formatted)
+            except Exception as exc:
+                print(f"Error fetching batched data for {', '.join(batch)}: {exc}")
+
+            fetched_symbols = {frame["symbol"].iloc[0] for frame in all_data if not frame.empty}
+            for symbol in batch:
+                if symbol in fetched_symbols:
+                    continue
+                try:
+                    formatted = self._fetch_single_symbol(
+                        symbol,
+                        period=period,
+                        interval=interval,
+                        start=start,
+                        end=end,
+                    )
+                    if not formatted.empty:
+                        all_data.append(formatted)
+                except Exception as exc:
+                    print(f"Error fetching data for {symbol}: {exc}")
+
+            time.sleep(0.1)
+
         return pd.concat(all_data, ignore_index=True) if all_data else pd.DataFrame()
     
     def fetch_alpha_vantage_data(self, symbol):

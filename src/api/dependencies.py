@@ -3,14 +3,23 @@ from functools import lru_cache
 
 
 def _sqlite_fallback_enabled() -> bool:
-    return os.getenv("ENABLE_SQLITE_FALLBACK", "false").strip().lower() == "true"
+    from config.settings import sqlite_fallback_enabled
+
+    return sqlite_fallback_enabled(default=True)
 
 
 @lru_cache
 def get_automation_agent():
     from agents.automation_agent import AutomationAgent
     from agents.data_collector_agent import DataCollectorAgent
-    from config.settings import API_KEYS, DATABASE_CONFIG, LLM_CONFIG, MARKET_CONFIG, MODEL_CONFIG
+    from config.settings import (
+        API_KEYS,
+        DATABASE_CONFIG,
+        LLM_CONFIG,
+        MARKET_CONFIG,
+        MODEL_CONFIG,
+        should_use_database_config,
+    )
     from data.database import DatabaseManager
     from models.lstm_model import LSTMPredictor
 
@@ -21,7 +30,7 @@ def get_automation_agent():
         "MODEL_CONFIG": MODEL_CONFIG,
     }
 
-    db_config = None if os.getenv("DB_URL") or os.getenv("DATABASE_URL") else DATABASE_CONFIG
+    db_config = DATABASE_CONFIG if should_use_database_config() else None
     db_manager = DatabaseManager(
         db_config,
         use_sqlite_fallback=_sqlite_fallback_enabled(),

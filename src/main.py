@@ -7,7 +7,15 @@ import subprocess
 import requests
 from loguru import logger
 
-from config.settings import DATABASE_CONFIG, API_KEYS, LLM_CONFIG, MARKET_CONFIG, MODEL_CONFIG
+from config.settings import (
+    DATABASE_CONFIG,
+    API_KEYS,
+    LLM_CONFIG,
+    MARKET_CONFIG,
+    MODEL_CONFIG,
+    should_use_database_config,
+    sqlite_fallback_enabled,
+)
 from data.database import DatabaseManager
 from agents.data_collector_agent import DataCollectorAgent
 from agents.automation_agent import AutomationAgent
@@ -15,7 +23,7 @@ from models.lstm_model import LSTMPredictor
 
 
 def _sqlite_fallback_enabled():
-    return os.getenv("ENABLE_SQLITE_FALLBACK", "false").strip().lower() == "true"
+    return sqlite_fallback_enabled(default=True)
 
 
 def configure_logging():
@@ -40,7 +48,7 @@ def configure_logging():
 
 def setup_database():
     """This function creates the database and necessary tables"""
-    db_config = None if os.getenv("DB_URL") or os.getenv("DATABASE_URL") else DATABASE_CONFIG
+    db_config = DATABASE_CONFIG if should_use_database_config() else None
     db_manager = DatabaseManager(
         db_config,
         use_sqlite_fallback=_sqlite_fallback_enabled(),
@@ -71,7 +79,19 @@ def run_dashboard():
     """Generates Streamlit dashboard in a separate, non-blocking process."""
     dashboard_path = os.path.join(os.path.dirname(__file__), 'dashboard', 'app.py')
     # Use Popen for non-blocking execution
-    command = ['streamlit', 'run', dashboard_path, '--server.port', '8501', '--server.headless', 'true']
+    command = [
+        'streamlit',
+        'run',
+        dashboard_path,
+        '--server.port',
+        '8501',
+        '--server.address',
+        '127.0.0.1',
+        '--server.headless',
+        'true',
+        '--browser.gatherUsageStats',
+        'false',
+    ]
     
     # Using Popen to run the dashboard as a background process
     proc = subprocess.Popen(command)

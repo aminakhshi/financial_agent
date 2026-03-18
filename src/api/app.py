@@ -12,6 +12,9 @@ class CollectRequest(BaseModel):
     symbols: List[str] = Field(default_factory=list)
     period: str = "5d"
     interval: str = "1h"
+    start: Optional[str] = None
+    end: Optional[str] = None
+    batch_size: Optional[int] = Field(default=None, ge=1, le=250)
 
 
 class UniverseCollectRequest(BaseModel):
@@ -19,6 +22,9 @@ class UniverseCollectRequest(BaseModel):
     symbols: List[str] = Field(default_factory=list)
     period: str = "1mo"
     interval: str = "1h"
+    start: Optional[str] = None
+    end: Optional[str] = None
+    batch_size: Optional[int] = Field(default=None, ge=1, le=250)
 
 
 class TrainRequest(BaseModel):
@@ -40,6 +46,30 @@ class PipelineRequest(BaseModel):
     symbols: List[str] = Field(default_factory=list)
     history_period: str = "6mo"
     interval: str = "1h"
+
+
+class DailyBackfillRequest(BaseModel):
+    universe: str = "sp500"
+    symbols: List[str] = Field(default_factory=list)
+    start: str = "1991-01-01"
+    end: Optional[str] = None
+    batch_size: Optional[int] = Field(default=None, ge=1, le=250)
+
+
+class HourlyBackfillRequest(BaseModel):
+    universe: str = "sp500"
+    symbols: List[str] = Field(default_factory=list)
+    period: str = "6mo"
+    end: Optional[str] = None
+    batch_size: Optional[int] = Field(default=None, ge=1, le=250)
+
+
+class Sp500BackfillRequest(BaseModel):
+    daily_start: str = "1991-01-01"
+    daily_end: Optional[str] = None
+    hourly_period: str = "6mo"
+    hourly_end: Optional[str] = None
+    batch_size: Optional[int] = Field(default=None, ge=1, le=250)
 
 
 app = FastAPI(
@@ -113,6 +143,9 @@ def collect_market_data(request: CollectRequest, agent: Any = Depends(get_automa
             symbols=request.symbols or None,
             period=request.period,
             interval=request.interval,
+            start=request.start,
+            end=request.end,
+            batch_size=request.batch_size,
         )
     except Exception as exc:
         _handle_service_error(exc)
@@ -126,6 +159,51 @@ def collect_market_universe(request: UniverseCollectRequest, agent: Any = Depend
             symbols=request.symbols or None,
             period=request.period,
             interval=request.interval,
+            start=request.start,
+            end=request.end,
+            batch_size=request.batch_size,
+        )
+    except Exception as exc:
+        _handle_service_error(exc)
+
+
+@app.post("/backfill/daily")
+def backfill_daily(request: DailyBackfillRequest, agent: Any = Depends(get_automation_agent)):
+    try:
+        return agent.backfill_daily_history(
+            universe=request.universe,
+            symbols=request.symbols or None,
+            start=request.start,
+            end=request.end,
+            batch_size=request.batch_size,
+        )
+    except Exception as exc:
+        _handle_service_error(exc)
+
+
+@app.post("/backfill/hourly")
+def backfill_hourly(request: HourlyBackfillRequest, agent: Any = Depends(get_automation_agent)):
+    try:
+        return agent.backfill_hourly_history(
+            universe=request.universe,
+            symbols=request.symbols or None,
+            period=request.period,
+            end=request.end,
+            batch_size=request.batch_size,
+        )
+    except Exception as exc:
+        _handle_service_error(exc)
+
+
+@app.post("/backfill/sp500")
+def backfill_sp500(request: Sp500BackfillRequest, agent: Any = Depends(get_automation_agent)):
+    try:
+        return agent.backfill_sp500_history(
+            daily_start=request.daily_start,
+            daily_end=request.daily_end,
+            hourly_period=request.hourly_period,
+            hourly_end=request.hourly_end,
+            batch_size=request.batch_size,
         )
     except Exception as exc:
         _handle_service_error(exc)
@@ -138,6 +216,7 @@ def market_history(
     start: Optional[str] = Query(None),
     end: Optional[str] = Query(None),
     exchange: Optional[str] = Query(None),
+    timeframe: Optional[str] = Query(None),
     limit: int = Query(1000, ge=1, le=100000),
     ascending: bool = Query(False),
     agent: Any = Depends(get_automation_agent),
@@ -149,8 +228,28 @@ def market_history(
             start=start,
             end=end,
             exchange=exchange,
+            timeframe=timeframe,
             limit_rows=limit,
             ascending=ascending,
+        )
+    except Exception as exc:
+        _handle_service_error(exc)
+
+
+@app.get("/coverage/summary")
+def coverage_summary(
+    symbols: Optional[List[str]] = Query(None),
+    universe: str = Query("configured"),
+    exchange: Optional[str] = Query(None),
+    timeframe: Optional[str] = Query(None),
+    agent: Any = Depends(get_automation_agent),
+):
+    try:
+        return agent.get_data_coverage(
+            symbols=symbols,
+            universe=universe,
+            exchange=exchange,
+            timeframe=timeframe,
         )
     except Exception as exc:
         _handle_service_error(exc)

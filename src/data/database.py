@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, DateTime, Index, UniqueConstraint, text
+    create_engine, Column, Integer, String, Float, DateTime, Index, UniqueConstraint, text, inspect
 )
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -26,6 +26,7 @@ class MarketData(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     symbol = Column(String(10), nullable=False)
     exchange = Column(String(10), nullable=False)  # 'SP500' or 'NASDAQ'
+    timeframe = Column(String(10), nullable=False, default="1h")
     timestamp = Column(DateTime, nullable=False)
     open_price = Column(Float, nullable=False)
     high_price = Column(Float, nullable=False)
@@ -50,6 +51,8 @@ class MarketData(Base):
         Index('idx_symbol_timestamp', 'symbol', 'timestamp'),
         Index('idx_exchange_timestamp', 'exchange', 'timestamp'),
         Index('idx_timestamp', 'timestamp'),
+        Index('idx_symbol_timeframe_timestamp', 'symbol', 'timeframe', 'timestamp'),
+        Index('idx_exchange_timeframe_timestamp', 'exchange', 'timeframe', 'timestamp'),
     )
 
 
@@ -102,6 +105,7 @@ class DatabaseManager:
         # Expose model classes for callers that reference them via manager instance.
         self.MarketData = MarketData
         self.PredictionResults = PredictionResults
+        self.use_sqlite_fallback = use_sqlite_fallback
         try:
             if config is None:
                 # fall back to env 
@@ -127,17 +131,31 @@ class DatabaseManager:
             self.engine = create_engine(db_url, **engine_kwargs)
             self.is_sqlite = db_url.startswith("sqlite")
         except Exception as e:
-            if use_sqlite_fallback:
-                print("\nWARNING: Unable to connect to PostgreSQL database. Falling back to SQLite.")
-                print(f"{e}")
-                sqlite_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 
-                                          "financial_data.db")
-                db_url = f"sqlite:///{sqlite_path}"
-                self.is_sqlite = True
-                self.engine = create_engine(db_url)
+            if self.use_sqlite_fallback:
+                self._activate_sqlite_fallback(e)
             else:
                 raise
         self.Session = sessionmaker(bind=self.engine, future=True)
+
+    def _sqlite_db_url(self) -> str:
+        configured_path = os.getenv("SQLITE_DB_PATH", "").strip()
+        if configured_path:
+            sqlite_path = configured_path
+        else:
+            sqlite_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                "financial_data.db",
+            )
+        return f"sqlite:///{sqlite_path}"
+
+    def _activate_sqlite_fallback(self, reason) -> None:
+        print("\nWARNING: Unable to use PostgreSQL. Falling back to SQLite.")
+        print(f"{reason}")
+        db_url = self._sqlite_db_url()
+        self.is_sqlite = True
+        self.engine = create_engine(db_url, future=True)
+        self.Session = sessionmaker(bind=self.engine, future=True)
+
     def _wait_for_db(self, tries=10, delay=1.5):
         """Optional: helpful in CI/startup races."""
         # Skip DB check for SQLite since it always works
@@ -151,29 +169,81 @@ class DatabaseManager:
                     conn.execute(text("SELECT 1"))
                 return
             except OperationalError as e:
-                if "database" in str(e) and "does not exist" in str(e):
+                error_text = str(e)
+                if "database" in error_text and "does not exist" in error_text:
                     db_user = os.getenv("DB_USER", "postgres")
                     print("\nERROR: Database does not exist. Please create it manually with:")
                     print("sudo -u postgres psql -c \"CREATE DATABASE financial_data;\"")
                     print(f"sudo -u postgres psql -c \"GRANT ALL PRIVILEGES ON DATABASE financial_data TO {db_user};\"\n")
-                    print("Attempting to use SQLite as fallback...")
-                    
-                    # Create a SQLite connection instead
-                    sqlite_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 
-                                             "financial_data.db")
-                    db_url = f"sqlite:///{sqlite_path}"
-                    self.engine = create_engine(db_url)
-                    self.Session = sessionmaker(bind=self.engine, future=True)
-                    self.is_sqlite = True
+
+                    if self.use_sqlite_fallback:
+                        self._activate_sqlite_fallback(error_text)
+                        return
+
+                common_connection_failure = any(
+                    marker in error_text.lower()
+                    for marker in (
+                        "password authentication failed",
+                        "connection refused",
+                        "could not connect to server",
+                        "timeout expired",
+                        "name or service not known",
+                        "temporary failure in name resolution",
+                    )
+                )
+                if self.use_sqlite_fallback and common_connection_failure:
+                    self._activate_sqlite_fallback(error_text)
                     return
-                    
+
                 if i == tries - 1:
+                    if self.use_sqlite_fallback:
+                        self._activate_sqlite_fallback(error_text)
+                        return
                     raise
                 time.sleep(delay)
 
     def create_tables(self):
         self._wait_for_db()
         Base.metadata.create_all(self.engine)
+        self._ensure_marketdata_schema()
+
+    def _ensure_marketdata_schema(self):
+        inspector = inspect(self.engine)
+        if "market_data" not in inspector.get_table_names():
+            return
+
+        columns = {column["name"] for column in inspector.get_columns("market_data")}
+        with self.engine.begin() as conn:
+            if "timeframe" not in columns:
+                conn.execute(text("ALTER TABLE market_data ADD COLUMN timeframe VARCHAR(10) DEFAULT '1h'"))
+            conn.execute(text("UPDATE market_data SET timeframe = '1h' WHERE timeframe IS NULL"))
+
+            if self.is_sqlite:
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_marketdata_symbol_timeframe_timestamp "
+                        "ON market_data(symbol, timeframe, timestamp)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_marketdata_exchange_timeframe_timestamp "
+                        "ON market_data(exchange, timeframe, timestamp)"
+                    )
+                )
+            else:
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_marketdata_symbol_timeframe_timestamp "
+                        "ON market_data(symbol, timeframe, timestamp)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_marketdata_exchange_timeframe_timestamp "
+                        "ON market_data(exchange, timeframe, timestamp)"
+                    )
+                )
 
     def insert_market_data(self, df: pd.DataFrame, exchange: Optional[str] = None):
         """Insert market data with handling for both PostgreSQL and SQLite."""
@@ -204,6 +274,7 @@ class DatabaseManager:
             records.append({
                 "symbol": row["symbol"],
                 "exchange": row["exchange"] if "exchange" in df.columns else exchange,
+                "timeframe": row["timeframe"] if "timeframe" in df.columns else "1h",
                 "timestamp": pd.to_datetime(row["timestamp"], utc=True).to_pydatetime(),
                 "open_price": float(row["open"]),
                 "high_price": float(row["high"]),
@@ -239,6 +310,7 @@ class DatabaseManager:
         symbol: str,
         limit_rows: int = 500,
         exchange: Optional[str] = None,
+        timeframe: Optional[str] = None,
         ascending: bool = True,
         deduplicate: bool = True,
     ):
@@ -255,6 +327,8 @@ class DatabaseManager:
             )
             if exchange:
                 stmt = stmt.where(MarketData.exchange == exchange)
+            if timeframe:
+                stmt = stmt.where(MarketData.timeframe == timeframe)
             df = pd.read_sql(stmt, conn)
 
         if df.empty:
@@ -267,7 +341,10 @@ class DatabaseManager:
             sort_columns = ["timestamp"]
             if "created_at" in df.columns:
                 sort_columns.append("created_at")
-            df = df.sort_values(sort_columns).drop_duplicates(subset=["timestamp"], keep="last")
+            dedupe_columns = ["timestamp"]
+            if timeframe is None and "timeframe" in df.columns:
+                dedupe_columns.append("timeframe")
+            df = df.sort_values(sort_columns).drop_duplicates(subset=dedupe_columns, keep="last")
         df = df.sort_values("timestamp", ascending=ascending)
         if limit_rows:
             df = df.tail(limit_rows) if ascending else df.head(limit_rows)
@@ -279,6 +356,7 @@ class DatabaseManager:
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
         exchange: Optional[str] = None,
+        timeframe: Optional[str] = None,
         limit_rows: Optional[int] = 1000,
         ascending: bool = False,
     ) -> pd.DataFrame:
@@ -293,6 +371,8 @@ class DatabaseManager:
                     stmt = stmt.where(MarketData.symbol.in_(normalized_symbols))
             if exchange:
                 stmt = stmt.where(MarketData.exchange == exchange)
+            if timeframe:
+                stmt = stmt.where(MarketData.timeframe == timeframe)
             if start is not None:
                 stmt = stmt.where(MarketData.timestamp >= pd.to_datetime(start, utc=True).to_pydatetime())
             if end is not None:
@@ -312,6 +392,57 @@ class DatabaseManager:
         if "created_at" in df.columns:
             df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
         return df.sort_values("timestamp", ascending=ascending).reset_index(drop=True)
+
+    def get_available_symbols(
+        self,
+        exchange: Optional[str] = None,
+        timeframe: Optional[str] = None,
+    ) -> list[str]:
+        from sqlalchemy import select
+
+        with self.engine.connect() as conn:
+            stmt = select(MarketData.symbol).distinct()
+            if exchange:
+                stmt = stmt.where(MarketData.exchange == exchange)
+            if timeframe:
+                stmt = stmt.where(MarketData.timeframe == timeframe)
+            rows = conn.execute(stmt.order_by(MarketData.symbol.asc())).fetchall()
+        return [str(row[0]).upper() for row in rows]
+
+    def get_market_coverage(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        exchange: Optional[str] = None,
+        timeframe: Optional[str] = None,
+    ) -> pd.DataFrame:
+        from sqlalchemy import func, select
+
+        with self.engine.connect() as conn:
+            stmt = select(
+                MarketData.symbol.label("symbol"),
+                MarketData.exchange.label("exchange"),
+                MarketData.timeframe.label("timeframe"),
+                func.count().label("row_count"),
+                func.min(MarketData.timestamp).label("first_timestamp"),
+                func.max(MarketData.timestamp).label("last_timestamp"),
+            )
+            if symbols:
+                normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+                if normalized_symbols:
+                    stmt = stmt.where(MarketData.symbol.in_(normalized_symbols))
+            if exchange:
+                stmt = stmt.where(MarketData.exchange == exchange)
+            if timeframe:
+                stmt = stmt.where(MarketData.timeframe == timeframe)
+            stmt = stmt.group_by(MarketData.symbol, MarketData.exchange, MarketData.timeframe)
+            df = pd.read_sql(stmt, conn)
+
+        if df.empty:
+            return df
+
+        df["first_timestamp"] = pd.to_datetime(df["first_timestamp"], utc=True)
+        df["last_timestamp"] = pd.to_datetime(df["last_timestamp"], utc=True)
+        return df.sort_values(["timeframe", "symbol"]).reset_index(drop=True)
 
     def upsert_prediction_results(self, records: Iterable[dict]) -> int:
         """Insert or update prediction rows keyed by symbol and prediction timestamp."""
@@ -420,6 +551,38 @@ class DatabaseManager:
             df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
         return df.sort_values("prediction_timestamp", ascending=ascending).reset_index(drop=True)
 
+    def get_prediction_coverage(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+    ) -> pd.DataFrame:
+        from sqlalchemy import case, func, select
+
+        with self.engine.connect() as conn:
+            stmt = select(
+                PredictionResults.symbol.label("symbol"),
+                func.count().label("prediction_count"),
+                func.sum(case((PredictionResults.actual_price.is_not(None), 1), else_=0)).label("evaluated_count"),
+                func.sum(case((PredictionResults.actual_price.is_(None), 1), else_=0)).label("pending_actual_count"),
+                func.min(PredictionResults.prediction_timestamp).label("first_prediction_timestamp"),
+                func.max(PredictionResults.prediction_timestamp).label("last_prediction_timestamp"),
+            )
+            if symbols:
+                normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+                if normalized_symbols:
+                    stmt = stmt.where(PredictionResults.symbol.in_(normalized_symbols))
+            stmt = stmt.group_by(PredictionResults.symbol).order_by(PredictionResults.symbol.asc())
+            df = pd.read_sql(stmt, conn)
+
+        if df.empty:
+            return df
+
+        df["first_prediction_timestamp"] = pd.to_datetime(df["first_prediction_timestamp"], utc=True)
+        df["last_prediction_timestamp"] = pd.to_datetime(df["last_prediction_timestamp"], utc=True)
+        df["coverage_pct"] = (
+            (df["evaluated_count"] / df["prediction_count"].replace(0, pd.NA)) * 100.0
+        ).fillna(0.0)
+        return df.reset_index(drop=True)
+
     def sync_prediction_actuals(self, symbols: Optional[Iterable[str]] = None) -> int:
         """Fill actual prices for predictions once matching market bars are available."""
         with self.Session() as session:
@@ -460,6 +623,7 @@ class DatabaseManager:
             record = {
                 "symbol": row["symbol"],
                 "exchange": row["exchange"] if "exchange" in df.columns else exchange,
+                "timeframe": row["timeframe"] if "timeframe" in df.columns else "1h",
                 "timestamp": pd.to_datetime(row["timestamp"], utc=True).to_pydatetime(),
                 "open_price": float(row["open"]),
                 "high_price": float(row["high"]),
