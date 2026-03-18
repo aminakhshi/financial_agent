@@ -1,0 +1,59 @@
+{
+  "id": "financial-market",
+  "name": "Financial Market",
+  "description": "OpenClaw tools and commands for market collection, forecasting, and scheduled report delivery.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "Base URL of the financial market FastAPI service.",
+        "default": "http://127.0.0.1:8000"
+      },
+      "timeoutMs": {
+        "type": "number",
+        "minimum": 1000,
+        "description": "HTTP timeout for market API calls in milliseconds.",
+        "default": 180000
+      },
+      "defaultSymbols": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Symbols used when no explicit symbols are provided.",
+        "default": ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA"]
+      },
+      "defaultPeriod": {
+        "type": "string",
+        "description": "Default market data refresh period.",
+        "default": "5d"
+      },
+      "defaultInterval": {
+        "type": "string",
+        "description": "Default model interval.",
+        "default": "1h"
+      },
+      "defaultReportRefresh": {
+        "type": "boolean",
+        "description": "Refresh market data and predictions before generating a report.",
+        "default": false
+      },
+      "delivery": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "every": { "type": "string" },
+          "cron": { "type": "string" },
+          "tz": { "type": "string" },
+          "channel": { "type": "string" },
+          "to": { "type": "string" },
+          "account": { "type": "string" },
+          "agent": { "type": "string" },
+          "session": { "type": "string", "default": "isolated" },
+          "bestEffortDeliver": { "type": "boolean", "default": true }
+        }
+      }
+    }
+  }
+}

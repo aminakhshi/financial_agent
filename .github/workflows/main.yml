@@ -16,9 +16,9 @@ jobs:
       postgres:
         image: postgres:15
         env:
-          POSTGRES_DB: ${{ secrets.POSTGRES_DB || 'financial_data' }}
-          POSTGRES_USER: ${{ secrets.POSTGRES_USER || 'postgres' }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD || 'postgres123' }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -60,9 +60,9 @@ jobs:
           API_KEY_POLYGON: ${{ secrets.API_KEY_POLYGON }}
           DB_HOST: localhost
           DB_PORT: 5432
-          DB_NAME: ${{ secrets.POSTGRES_DB || 'financial_data' }}
-          DB_USER: ${{ secrets.POSTGRES_USER || 'postgres' }}
-          DB_PASSWORD: ${{ secrets.POSTGRES_PASSWORD || 'postgres123' }}
+          DB_NAME: ${{ secrets.POSTGRES_DB }}
+          DB_USER: ${{ secrets.POSTGRES_USER }}
+          DB_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
         run: |
           echo "Testing application with PostgreSQL database..."
           cd src && python -c "
@@ -86,9 +86,9 @@ jobs:
       run: |
         echo "DB_HOST=postgres" > .env
         echo "DB_PORT=5432" >> .env
-        echo "DB_NAME=${{ secrets.POSTGRES_DB || 'financial_data' }}" >> .env
-        echo "DB_USER=${{ secrets.POSTGRES_USER || 'postgres' }}" >> .env
-        echo "DB_PASSWORD=${{ secrets.POSTGRES_PASSWORD || 'postgres123' }}" >> .env
+        echo "DB_NAME=${{ secrets.POSTGRES_DB }}" >> .env
+        echo "DB_USER=${{ secrets.POSTGRES_USER }}" >> .env
+        echo "DB_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}" >> .env
         echo "API_KEY_ALPHAVANTAGE=${{ secrets.API_KEY_ALPHAVANTAGE }}" >> .env
         echo "API_KEY_FINANCIALMODELINGPREP=${{ secrets.API_KEY_FINANCIALMODELINGPREP }}" >> .env
         echo "API_KEY_NEWS=${{ secrets.API_KEY_NEWS }}" >> .env
