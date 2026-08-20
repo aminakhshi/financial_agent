@@ -114,6 +114,37 @@ MARKET_CONFIG = {
     'download_batch_size': int(os.getenv('DOWNLOAD_BATCH_SIZE', '25')),
 }
 
+# Data ingestion configuration (universes, incremental collection, scheduler)
+INGESTION_CONFIG = {
+    # Broad market index tickers collected at both resolutions.
+    'index_symbols': ['^GSPC', '^IXIC', '^DJI', '^RUT'],
+    # The 11 GICS sector ETFs (stable, cheap-to-fetch sector series).
+    'sector_etf_symbols': ['XLK', 'XLF', 'XLE', 'XLV', 'XLI', 'XLY', 'XLP', 'XLU', 'XLB', 'XLRE', 'XLC'],
+    # Index whose constituents are tracked with point-in-time membership.
+    'constituents_index': '^GSPC',
+    # Universe names used by the scheduled jobs.
+    'hourly_universe': os.getenv('INGESTION_HOURLY_UNIVERSE', 'all'),
+    'daily_universe': os.getenv('INGESTION_DAILY_UNIVERSE', 'all'),
+    # Sector aggregate series ('equal_weight' is the only implemented method).
+    'aggregate_method': os.getenv('AGGREGATE_METHOD', 'equal_weight'),
+    'aggregate_recompute_days': int(os.getenv('AGGREGATE_RECOMPUTE_DAYS', '7')),
+    # Backfill horizon for daily history; hourly is capped by the provider (~730d).
+    'backfill_start': os.getenv('BACKFILL_START', '1991-01-01'),
+    # Fetching behavior.
+    'batch_size': int(os.getenv('DOWNLOAD_BATCH_SIZE', '25')),
+    'inter_batch_delay_s': float(os.getenv('INTER_BATCH_DELAY_S', '1.0')),
+    'max_retries': int(os.getenv('PROVIDER_MAX_RETRIES', '3')),
+    # Background scheduler (dedicated service; disabled unless explicitly enabled).
+    'scheduler_enabled': env_flag('SCHEDULER_ENABLED', default=False),
+    'scheduler_timezone': os.getenv('SCHEDULER_TIMEZONE', 'America/New_York'),
+    'hourly_collect_minute': int(os.getenv('HOURLY_COLLECT_MINUTE', '5')),
+    'daily_collect_time': os.getenv('DAILY_COLLECT_TIME', '17:30'),  # scheduler timezone
+    'membership_refresh_day': os.getenv('MEMBERSHIP_REFRESH_DAY', 'sat'),
+    'membership_refresh_time': os.getenv('MEMBERSHIP_REFRESH_TIME', '08:00'),
+    'gap_repair_enabled': env_flag('GAP_REPAIR_ENABLED', default=True),
+    'exchange_calendar': os.getenv('EXCHANGE_CALENDAR', 'XNYS'),
+}
+
 # Model training configuration
 MODEL_CONFIG = {
     'sequence_length': 60,

@@ -67,11 +67,21 @@ jobs:
           echo "Testing application with PostgreSQL database..."
           cd src && python -c "
           import sys
-          from config.settings import API_KEYS, DATABASE_CONFIG
+          from config.settings import API_KEYS, DATABASE_CONFIG, INGESTION_CONFIG
           print('✓ Application configuration loaded successfully')
           print('✓ Database connection configured')
           print('✓ API keys configuration loaded')
           "
+
+      - name: Run unit tests (no network)
+        run: |
+          python -m pytest tests/ -q
+
+      - name: Run schema migrations against a scratch SQLite database
+        env:
+          DB_URL: sqlite:///./ci_scratch.db
+        run: |
+          PYTHONPATH=src python -m ingestion.cli migrate
 
   deploy-production:
     runs-on: ubuntu-latest

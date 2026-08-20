@@ -1,4 +1,3 @@
-import asyncio
 import os
 from datetime import datetime, timedelta
 from math import sqrt
@@ -33,7 +32,7 @@ class AutomationAgent:
         self.crewai_enabled = os.getenv("DISABLE_CREWAI", "false").strip().lower() != "true"
         configured_defaults = self.config["MARKET_CONFIG"].get("default_symbols", self.DEFAULT_SYMBOLS)
         self.default_symbols = self._resolve_symbols(configured_defaults)
-        self.exchange_lookup = self._build_exchange_lookup()
+        self.ingestion = self._build_ingestion_service()
         self.llm = self._build_llm()
 
         if self.crewai_enabled:
@@ -106,12 +105,11 @@ class AutomationAgent:
 
                 return SimpleMockLLM()
 
-    def _build_exchange_lookup(self) -> Dict[str, str]:
-        lookup: Dict[str, str] = {}
-        for market_name, config_key in (("SP500", "sp500_symbols"), ("NASDAQ", "nasdaq_symbols")):
-            for symbol in self.config["MARKET_CONFIG"].get(config_key, []):
-                lookup.setdefault(symbol.upper(), market_name)
-        return lookup
+    def _build_ingestion_service(self):
+        from ingestion.service import IngestionService
+
+        provider = getattr(self.data_collector, "provider", None)
+        return IngestionService(self.config, self.db_manager, provider=provider)
 
     def _resolve_symbols(self, symbols: Optional[Iterable[str]] = None) -> List[str]:
         source = symbols or self.DEFAULT_SYMBOLS
@@ -130,35 +128,7 @@ class AutomationAgent:
         universe: str = "default",
         symbols: Optional[Iterable[str]] = None,
     ) -> List[str]:
-        if symbols:
-            resolved = self._resolve_symbols(symbols)
-            if resolved:
-                return resolved
-
-        normalized_universe = (universe or "default").strip().lower()
-        configured_sp500 = self.config["MARKET_CONFIG"].get("sp500_symbols", [])
-        configured_nasdaq = self.config["MARKET_CONFIG"].get("nasdaq_symbols", [])
-        universe_map = {
-            "default": self.default_symbols,
-            "watchlist": self.default_symbols,
-            "sp500": configured_sp500,
-            "s&p500": configured_sp500,
-            "sp500_full": configured_sp500,
-            "nasdaq": configured_nasdaq,
-            "all": configured_sp500 + configured_nasdaq,
-            "configured": configured_sp500 + configured_nasdaq,
-            "configured_all": configured_sp500 + configured_nasdaq,
-        }
-
-        if normalized_universe not in universe_map:
-            raise ValueError(
-                "Unsupported universe. Use one of: default, sp500, nasdaq, all, configured."
-            )
-
-        resolved = self._resolve_symbols(universe_map[normalized_universe])
-        if not resolved:
-            raise ValueError(f"No symbols are configured for universe '{normalized_universe}'.")
-        return resolved
+        return self.ingestion.universes.resolve(universe=universe, symbols=symbols)
 
     def _model_factory(self):
         return self.ml_predictor.__class__(self.config)
@@ -388,51 +358,17 @@ class AutomationAgent:
         range_label = f"start={start}, end={end or 'latest'}" if start or end else f"period {period}"
         logger.info(f"Collecting {interval} market data for {', '.join(symbols)} using {range_label}.")
 
-        market_data = self.data_collector.fetch_yfinance_data(
-            symbols,
-            period=period,
-            interval=interval,
+        report = self.ingestion.collect(
+            symbols=symbols,
+            timeframe=interval,
             start=start,
             end=end,
+            period=None if (start or end) else period,
             batch_size=batch_size,
         )
-        if market_data.empty:
-            return {
-                "status": "no_data",
-                "symbols": symbols,
-                "rows_collected": 0,
-                "timeframe": interval,
-                "message": "No market data was returned by the provider.",
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-
-        market_data = market_data.copy()
-        market_data["symbol"] = market_data["symbol"].astype(str).str.upper()
-        market_data["exchange"] = market_data["symbol"].map(self.exchange_lookup).fillna("US")
-        market_data["timeframe"] = interval
-        self.db_manager.insert_market_data(market_data)
-        actuals_updated = self.db_manager.sync_prediction_actuals(symbols, timeframe=interval)
-        rows_by_symbol = {
-            symbol: int(count) for symbol, count in market_data.groupby("symbol").size().to_dict().items()
-        }
-
-        message = (
-            f"Collected {len(market_data)} rows across {len(rows_by_symbol)} symbols. "
-            f"Updated {actuals_updated} prediction records with realized prices."
-        )
-        return {
-            "status": "ok",
-            "symbols": symbols,
-            "period": period,
-            "interval": interval,
-            "start": start,
-            "end": end,
-            "rows_collected": int(len(market_data)),
-            "rows_by_symbol": rows_by_symbol,
-            "actuals_updated": int(actuals_updated),
-            "message": message,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
+        report["timeframe"] = interval
+        report["period"] = period
+        return report
 
     def collect_market_universe(
         self,
@@ -444,23 +380,16 @@ class AutomationAgent:
         end: Optional[str] = None,
         batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
-        resolved_symbols = self._resolve_market_universe(universe=universe, symbols=symbols)
-        result = self.collect_market_data(
-            resolved_symbols,
-            period=period,
-            interval=interval,
+        result = self.ingestion.collect(
+            symbols=symbols,
+            universe=universe,
+            timeframe=interval,
             start=start,
             end=end,
+            period=None if (start or end) else period,
             batch_size=batch_size,
         )
-        result["universe"] = (universe or "custom").strip().lower()
-        result["requested_symbol_count"] = len(resolved_symbols)
-        result["stored_symbol_count"] = len(result.get("rows_by_symbol", {}))
-        result["message"] = (
-            f"Collected {result['rows_collected']} rows for {result['stored_symbol_count']} of "
-            f"{len(resolved_symbols)} configured symbols in the {result['universe']} universe. "
-            f"Updated {result['actuals_updated']} prediction records with realized prices."
-        )
+        result["period"] = period
         return result
 
     def backfill_daily_history(
@@ -471,20 +400,14 @@ class AutomationAgent:
         end: Optional[str] = None,
         batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
-        start = start or self.config["MARKET_CONFIG"].get("sp500_daily_backfill_start", "1991-01-01")
-        result = self.collect_market_universe(
-            universe=universe,
+        result = self.ingestion.backfill_daily(
             symbols=symbols,
-            interval="1d",
+            universe=universe,
             start=start,
             end=end,
             batch_size=batch_size,
         )
         result["backfill_type"] = "daily"
-        result["message"] = (
-            f"Stored daily backfill rows from {start} through {end or 'latest'} for "
-            f"{result['stored_symbol_count']} symbols."
-        )
         return result
 
     def backfill_hourly_history(
@@ -495,19 +418,15 @@ class AutomationAgent:
         end: Optional[str] = None,
         batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
-        period = period or self.config["MARKET_CONFIG"].get("sp500_hourly_backfill_period", "6mo")
-        result = self.collect_market_universe(
-            universe=universe,
+        # `period` is deprecated: hourly backfills now always cover the provider's
+        # full intraday lookback (~730 days).
+        result = self.ingestion.backfill_hourly(
             symbols=symbols,
-            period=period,
-            interval="1h",
+            universe=universe,
             end=end,
             batch_size=batch_size,
         )
         result["backfill_type"] = "hourly"
-        result["message"] = (
-            f"Stored hourly backfill rows for the last {period} for {result['stored_symbol_count']} symbols."
-        )
         return result
 
     def backfill_sp500_history(
@@ -1355,15 +1274,3 @@ class AutomationAgent:
             "message": "The hourly market update completed.",
         }
 
-    def schedule_operations(self):
-        """Schedule regular operations."""
-        import schedule
-        import time
-
-        schedule.every().hour.do(self.run_hourly_update)
-        schedule.every().day.at("02:00").do(lambda: asyncio.run(self.run_full_pipeline()))
-
-        logger.info("Scheduler started. Waiting for the next market update window.")
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
