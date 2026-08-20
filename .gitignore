@@ -46,6 +46,14 @@ var/
 logs/
 *.log
 
+# Ad-hoc pipeline run artifacts
+/coverage_*.json
+/sp500_*.json
+/sp500_*.csv
+
+# Test caches
+.pytest_cache/
+
 # Documentation build output
 docs/_build/
 

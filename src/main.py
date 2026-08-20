@@ -1,6 +1,5 @@
 import asyncio
 import os
-import threading
 import traceback
 import subprocess
 
@@ -10,6 +9,7 @@ from loguru import logger
 from config.settings import (
     DATABASE_CONFIG,
     API_KEYS,
+    INGESTION_CONFIG,
     LLM_CONFIG,
     MARKET_CONFIG,
     MODEL_CONFIG,
@@ -64,7 +64,8 @@ def setup_agents(db_manager):
         'LLM_CONFIG': LLM_CONFIG,
         'API_KEYS': API_KEYS,
         'MARKET_CONFIG': MARKET_CONFIG,
-        'MODEL_CONFIG': MODEL_CONFIG
+        'MODEL_CONFIG': MODEL_CONFIG,
+        'INGESTION_CONFIG': INGESTION_CONFIG,
     }
 
     data_collector = DataCollectorAgent(config, db_manager)
@@ -129,18 +130,28 @@ async def main():
 
         orchestrator = setup_agents(db_manager)
 
-        # Launch the dashboard
-        dashboard_thread = threading.Thread(target=run_dashboard)
-        dashboard_thread.daemon = True
-        dashboard_thread.start()
+        # Launch the dashboard (Popen is already non-blocking)
+        dashboard_proc = run_dashboard()
         logger.info("Dashboard is available at http://localhost:8501.")
 
         logger.info("Starting the initial market pipeline run.")
         await orchestrator.run_full_pipeline()
         logger.success("Initial pipeline run finished successfully.")
 
-        logger.info("Starting scheduled updates.")
-        orchestrator.schedule_operations()
+        from config.settings import INGESTION_CONFIG
+
+        if INGESTION_CONFIG.get("scheduler_enabled"):
+            from ingestion.scheduler import run_scheduler
+
+            logger.info("SCHEDULER_ENABLED=true - starting the ingestion scheduler in this process.")
+            run_scheduler(orchestrator.ingestion)
+        else:
+            logger.info(
+                "Background scheduler is disabled. Enable it with SCHEDULER_ENABLED=true, run "
+                "`PYTHONPATH=src python -m ingestion.cli serve`, or start the financial_scheduler "
+                "docker-compose service."
+            )
+            dashboard_proc.wait()
 
     except KeyboardInterrupt:
         logger.info("Shutting down the service.")

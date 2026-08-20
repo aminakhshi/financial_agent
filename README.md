@@ -52,28 +52,37 @@ The project now includes a FastAPI service for external automation and assistant
 - Build a market report: `GET /reports/market-summary`
 - Read recent logs: `GET /logs/recent`
 
-## Background Behavior
+## Data Ingestion & Background Scheduler
 
-There are two different ways to run this project, and they behave differently:
+Deterministic ingestion lives in `src/ingestion/` (no LLM involved) and is driven three ways:
 
-- `PYTHONPATH=src python -m main`
-  This starts the integrated Python service in `src/main.py`. It runs an initial full pipeline, then keeps running in the foreground with:
-  - hourly incremental updates
-  - a daily full pipeline at `02:00`
-  - the Streamlit dashboard on port `8501`
-- `PYTHONPATH=src uvicorn api.app:app --host 0.0.0.0 --port 8000`
-  This starts only the FastAPI service. It does not schedule background collection by itself.
+- **One-shot CLI** (cron/EventBridge friendly, prints JSON run reports):
 
-If you want continuous background updates, keep `python -m main` running under `systemd`, Docker, `tmux`, or another process manager.
+  ```bash
+  export PYTHONPATH=src
+  python -m ingestion.cli migrate                    # apply schema migrations
+  python -m ingestion.cli membership seed            # seed S&P 500 membership
+  python -m ingestion.cli membership refresh         # diff vs live list + backfill new members
+  python -m ingestion.cli collect --timeframe 1h --universe all   # incremental collection
+  python -m ingestion.cli backfill --timeframe 1d --start 1991-01-01
+  python -m ingestion.cli aggregates recompute --timeframe 1d --full
+  ```
+
+- **Background scheduler** (APScheduler, market-calendar aware): `python -m ingestion.cli serve`, or `docker compose up -d financial_scheduler`, or set `SCHEDULER_ENABLED=true` for `python -m main`. It runs hourly collection during market hours, daily collection after the close, a weekly S&P 500 membership refresh, weekly gap repair, and sector-aggregate recomputes. The container works as-is on AWS ECS/EC2 (only DB env vars needed).
+
+- **API**: collection routes call the same service; backfills run as background jobs (`POST /backfill/*` returns a `job_id`; poll `GET /ingestion/runs`).
+
+Collection is **incremental**: each run fetches only the gap since the latest stored bar per `(symbol, timeframe)`. The universe covers index tickers (`^GSPC`, `^IXIC`, `^DJI`, `^RUT`), the 11 GICS sector ETFs, and all S&P 500 constituents at both `1h` and `1d`. Hourly history is capped at ~730 days by yfinance.
 
 ## SQL Storage Behavior
 
-Historical data is stored incrementally in SQL.
+Historical data is stored incrementally in SQL; the schema is managed by Alembic migrations (applied automatically on startup, including in-place upgrades of pre-existing databases).
 
-- Market bars are stored in `market_data`.
-- Existing bars are upserted by `symbol + exchange + timestamp`, so old history stays in the database and only matching bars are refreshed.
-- Predictions are stored in `prediction_results`.
-- When later market bars arrive, the code backfills `actual_price` for matching prediction timestamps so you can measure model accuracy over time.
+- Market bars are stored in `market_data`, upserted in chunks by `symbol + timeframe + timestamp`, so daily and hourly bars coexist and re-collection is idempotent. Prices are split/dividend-adjusted (`auto_adjust=True`).
+- `instruments` is the symbol dimension (name, exchange, GICS sector, kind: equity/index/etf/synthetic, active flag).
+- `index_membership` tracks point-in-time S&P 500 membership: symbols that leave the index are closed out (`effective_to`) but their price history is **never deleted**, so training data horizons stay stable. A weekly refresh diffs against the live constituent list and backfills new members automatically.
+- Synthetic sector series (`SECT_ENRG`, `SECT_INFT`, ...) are chained equal-weighted return indices over point-in-time sector members — stable training targets that survive membership churn — stored at both `1d` and `1h`.
+- Predictions are stored in `prediction_results`; `actual_price` is backfilled when matching bars arrive so accuracy can be measured over time.
 
 ## Recommended Periods And Intervals
 
@@ -94,12 +103,19 @@ export PYTHONPATH=src
 uvicorn api.app:app --host 127.0.0.1 --port 8000
 ```
 
-Start the full background scheduler plus dashboard:
+Start the dashboard plus initial pipeline (add `SCHEDULER_ENABLED=true` for background updates):
 
 ```bash
 cd /path/to/financial_agent
 export PYTHONPATH=src
 python -m main
+```
+
+Start only the background ingestion scheduler:
+
+```bash
+export PYTHONPATH=src
+python -m ingestion.cli serve
 ```
 
 Collect one stock into SQL:
@@ -120,11 +136,12 @@ curl -X POST http://127.0.0.1:8000/market-data/collect-universe \
 
 Supported `universe` values:
 
-- `default`
-- `sp500`
-- `nasdaq`
-- `all`
-- `configured`
+- `default` — the small watchlist
+- `indices` — `^GSPC`, `^IXIC`, `^DJI`, `^RUT`
+- `sector_etfs` — the 11 GICS sector ETFs
+- `sp500` / `constituents` — current S&P 500 members (from the membership table)
+- `all` — indices + sector ETFs + constituents
+- `nasdaq`, `configured` — legacy configured lists
 
 Train one symbol:
 

@@ -1,6 +1,54 @@
 Operations and Workflows
 ========================
 
+Ingestion CLI (one-shot jobs)
+-----------------------------
+
+All ingestion jobs run without the API, printing a JSON run report — suitable
+for external cron or AWS EventBridge:
+
+.. code-block:: bash
+
+   export PYTHONPATH=src
+   python -m ingestion.cli migrate                       # apply schema migrations
+   python -m ingestion.cli membership seed               # seed S&P 500 membership
+   python -m ingestion.cli membership refresh            # diff vs live list, backfill new members
+   python -m ingestion.cli membership show
+   python -m ingestion.cli collect --timeframe 1h --universe all     # incremental
+   python -m ingestion.cli collect --timeframe 1d --symbols AAPL MSFT
+   python -m ingestion.cli backfill --timeframe 1d --start 1991-01-01
+   python -m ingestion.cli backfill --timeframe 1h                   # ~730d provider cap
+   python -m ingestion.cli aggregates recompute --timeframe 1d --full
+   python -m ingestion.cli repair --timeframe 1d --days 30
+   python -m ingestion.cli serve                         # blocking APScheduler service
+
+Background scheduler
+--------------------
+
+Enable continuous collection either with the dedicated docker-compose service:
+
+.. code-block:: bash
+
+   docker compose up -d financial_scheduler
+
+or in-process with ``python -m main`` by setting ``SCHEDULER_ENABLED=true``.
+Schedule times, universes, and batch sizes are configured through environment
+variables (see ``.env.example``). On AWS, run the same container image with
+``python -m ingestion.cli serve`` as the command (ECS/EC2), or trigger the
+one-shot CLI commands from EventBridge.
+
+Migrating an existing database
+------------------------------
+
+Databases created before this ingestion layer are migrated in place the first
+time any entry point starts (or via ``python -m ingestion.cli migrate``):
+duplicate bars from legacy exchange labels are deduplicated (last write wins),
+the unique key becomes ``(symbol, timeframe, timestamp)``, and the instrument +
+membership tables are created and seeded. Back up PostgreSQL first
+(``pg_dump``) and stop the API/scheduler during the upgrade. Because prices
+are now stored dividend/split-adjusted, finish by re-running the daily
+backfill once: ``python -m ingestion.cli backfill --timeframe 1d``.
+
 Run one symbol hourly
 ---------------------
 
@@ -58,22 +106,40 @@ Generate a daily prediction:
 Run a full daily S&P 500 backfill
 ---------------------------------
 
+Backfill routes now return immediately with a job id and run in the
+background; poll ``/ingestion/runs`` for the result:
+
 .. code-block:: bash
 
-   time curl -X POST http://127.0.0.1:8000/backfill/daily \
+   curl -X POST http://127.0.0.1:8000/backfill/daily \
      -H 'Content-Type: application/json' \
-     -d '{"universe":"sp500","start":"1991-01-01","batch_size":25}' \
-     -o sp500_daily_backfill.json
+     -d '{"universe":"sp500","start":"1991-01-01","batch_size":25}'
+   # -> {"status": "accepted", "job_id": "..."}
+
+   curl 'http://127.0.0.1:8000/ingestion/runs?job_id=<job_id>' | python -m json.tool
 
 Run a full hourly S&P 500 backfill
 ----------------------------------
 
+Hourly backfills always cover the provider's full intraday lookback (~730
+days); the legacy ``period`` field is ignored:
+
 .. code-block:: bash
 
-   time curl -X POST http://127.0.0.1:8000/backfill/hourly \
+   curl -X POST http://127.0.0.1:8000/backfill/hourly \
      -H 'Content-Type: application/json' \
-     -d '{"universe":"sp500","period":"6mo","batch_size":25}' \
-     -o sp500_hourly_backfill.json
+     -d '{"universe":"sp500","batch_size":25}'
+
+Membership, instruments, and aggregates over the API
+----------------------------------------------------
+
+.. code-block:: bash
+
+   curl -X POST http://127.0.0.1:8000/ingestion/membership/refresh
+   curl 'http://127.0.0.1:8000/ingestion/membership?asof=2024-06-01' | python -m json.tool
+   curl -X POST 'http://127.0.0.1:8000/ingestion/aggregates/recompute?timeframe=1d&full=true'
+   curl 'http://127.0.0.1:8000/instruments?kind=synthetic' | python -m json.tool
+   curl 'http://127.0.0.1:8000/ingestion/runs' | python -m json.tool
 
 Check coverage after a backfill
 -------------------------------
@@ -115,9 +181,9 @@ Use ``python -m main`` when you want a single long-running process to:
 
 * launch the dashboard
 * run the initial pipeline
-* schedule hourly updates
-* schedule the daily full run
+* optionally run the ingestion scheduler (``SCHEDULER_ENABLED=true``)
 
 Do not use it as a replacement for explicit long historical backfills if you
-need precise control over time windows, batches, or direct API access.
+need precise control over time windows, batches, or direct API access — use
+``python -m ingestion.cli`` for those.
 

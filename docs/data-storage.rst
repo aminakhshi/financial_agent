@@ -8,9 +8,18 @@ The project stores state in SQL and on disk.
 
 SQL tables:
 
-* ``market_data``
+* ``market_data`` — one bar per ``(symbol, timeframe, timestamp)``
+* ``instruments`` — symbol dimension (name, real exchange, GICS sector,
+  currency, kind: equity/index/etf/synthetic, active flag)
+* ``index_membership`` — point-in-time index membership
+  (``effective_from``/``effective_to``; ``effective_to IS NULL`` = current member)
 * ``prediction_results``
 * ``model_monitor_events``
+
+The schema is managed by Alembic migrations under ``src/data/migrations``.
+Every entry point runs ``upgrade head`` on startup; databases created before
+Alembic are stamped at the baseline automatically and migrated in place
+(existing daily history is preserved).
 
 File-based artifacts:
 
@@ -23,9 +32,41 @@ Market data behavior
 
 Historical market bars are stored incrementally.
 
-* Existing history is preserved.
-* Matching bars are refreshed on upsert.
-* Daily and hourly bars are separated by the ``timeframe`` column.
+* Existing history is preserved; delisted symbols keep their bars forever.
+* Bars are upserted in chunks keyed by ``(symbol, timeframe, timestamp)``,
+  so daily and hourly bars for the same moment coexist and re-collection is
+  idempotent.
+* Collection is watermark-driven: each run fetches only the gap since the
+  latest stored bar per symbol (plus a two-bar overlap to repair partially
+  formed bars).
+* Prices are fetched split- and dividend-adjusted (``auto_adjust=True``). If
+  your database predates this change, run a full daily re-backfill once:
+  ``python -m ingestion.cli backfill --timeframe 1d``.
+* Hourly history is limited to roughly the last 730 days by the data provider.
+* The legacy ``exchange`` column is deprecated (kept nullable for API
+  compatibility); real listing venues live on ``instruments.exchange``.
+
+Index membership behavior
+-------------------------
+
+* The initial S&P 500 membership is seeded from
+  ``src/data/static/sp500_symbols.txt`` effective from the backfill horizon
+  (current members are assumed to have been members through stored history — a
+  documented approximation until real historical changes are imported).
+* The weekly refresh diffs the live constituent list (Wikipedia) against open
+  memberships: removed symbols get ``effective_to`` set and their instrument
+  marked inactive — price rows are never deleted; added symbols get an open
+  row and are backfilled automatically.
+* Point-in-time queries: ``GET /ingestion/membership?asof=YYYY-MM-DD``.
+
+Sector aggregate series
+-----------------------
+
+Synthetic sector indices (``SECT_ENRG``, ``SECT_INFT``, ...) are chained
+equal-weighted return indices over the point-in-time S&P 500 members of each
+GICS sector, stored through the normal upsert at both ``1d`` and ``1h``.
+Chaining means membership changes never cause level jumps, so these series are
+stable model-training targets that survive index churn.
 
 Prediction behavior
 -------------------

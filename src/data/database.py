@@ -1,9 +1,10 @@
 import os
-from datetime import datetime, timezone
-from typing import Iterable, Optional
+from datetime import date, datetime, timezone
+from typing import Iterable, List, Optional
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, DateTime, Index, UniqueConstraint, text, inspect
+    create_engine, event, Boolean, Column, Date, DateTime, Float, Index, Integer, String,
+    UniqueConstraint, text, inspect
 )
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -11,7 +12,7 @@ from sqlalchemy.exc import OperationalError
 from urllib.parse import quote_plus
 import pandas as pd
 
-# load local .env 
+# load local .env
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -20,14 +21,22 @@ except Exception:
 
 Base = declarative_base()
 
+# Rows per bulk upsert statement. Keeps bind-parameter counts well under the
+# PostgreSQL 65535 limit (~16 columns/row) and bounds transaction size so a
+# failure loses at most one chunk of a large backfill.
+UPSERT_CHUNK_SIZE = 500
+
+
 class MarketData(Base):
     __tablename__ = 'market_data'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    symbol = Column(String(10), nullable=False)
-    exchange = Column(String(10), nullable=False)  # 'SP500' or 'NASDAQ'
+    symbol = Column(String(20), nullable=False)
+    # Deprecated: legacy index label ('SP500'/'NASDAQ'/'US'). Real venue now
+    # lives on instruments.exchange; kept nullable for API back-compat.
+    exchange = Column(String(10), nullable=True)
     timeframe = Column(String(10), nullable=False, default="1h")
-    timestamp = Column(DateTime, nullable=False)
+    timestamp = Column(DateTime(timezone=True), nullable=False)
     open_price = Column(Float, nullable=False)
     high_price = Column(Float, nullable=False)
     low_price = Column(Float, nullable=False)
@@ -43,16 +52,53 @@ class MarketData(Base):
     bollinger_upper = Column(Float)
     bollinger_lower = Column(Float)
 
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
-        # Avoid duplicates when reloading the same bar
-        UniqueConstraint('symbol', 'exchange', 'timestamp', name='uq_marketdata_symbol_exch_ts'),
+        # One bar per symbol/resolution/moment; a 1d and a 1h bar at the same
+        # timestamp are distinct rows.
+        UniqueConstraint('symbol', 'timeframe', 'timestamp', name='uq_marketdata_symbol_timeframe_ts'),
         Index('idx_symbol_timestamp', 'symbol', 'timestamp'),
-        Index('idx_exchange_timestamp', 'exchange', 'timestamp'),
         Index('idx_timestamp', 'timestamp'),
         Index('idx_symbol_timeframe_timestamp', 'symbol', 'timeframe', 'timestamp'),
-        Index('idx_exchange_timeframe_timestamp', 'exchange', 'timeframe', 'timestamp'),
+    )
+
+
+class Instrument(Base):
+    __tablename__ = 'instruments'
+
+    symbol = Column(String(20), primary_key=True)
+    name = Column(String(200))
+    exchange = Column(String(20))  # real listing venue (e.g. NMS, NYQ); NULL for synthetic
+    sector = Column(String(50))    # GICS sector; for synthetic series, the aggregated sector
+    currency = Column(String(10))
+    kind = Column(String(20), nullable=False, default='equity')  # equity | index | etf | synthetic
+    active = Column(Boolean, nullable=False, default=True)
+    first_seen = Column(DateTime(timezone=True))
+    last_seen = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class IndexMembership(Base):
+    __tablename__ = 'index_membership'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    index_symbol = Column(String(20), nullable=False)
+    symbol = Column(String(20), nullable=False)
+    effective_from = Column(Date, nullable=False)
+    effective_to = Column(Date, nullable=True)  # NULL = currently a member
+    source = Column(String(50))  # 'seed_file' | 'wikipedia_refresh' | 'manual'
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint('index_symbol', 'symbol', 'effective_from', name='uq_membership_index_symbol_from'),
+        Index('idx_membership_index_open', 'index_symbol', 'effective_to'),
+        Index('idx_membership_symbol', 'symbol'),
     )
 
 
@@ -60,14 +106,14 @@ class PredictionResults(Base):
     __tablename__ = 'prediction_results'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    symbol = Column(String(10), nullable=False)
+    symbol = Column(String(20), nullable=False)
     timeframe = Column(String(10), nullable=False, default="1h")
-    prediction_timestamp = Column(DateTime, nullable=False)
+    prediction_timestamp = Column(DateTime(timezone=True), nullable=False)
     predicted_price = Column(Float, nullable=False)
     confidence_score = Column(Float, nullable=False)
     model_version = Column(String(50), nullable=False)
     actual_price = Column(Float)  # Filled later for evaluation
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
         UniqueConstraint('symbol', 'timeframe', 'prediction_timestamp', name='uq_prediction_symbol_timeframe_ts'),
@@ -81,16 +127,16 @@ class ModelMonitorEvent(Base):
     __tablename__ = 'model_monitor_events'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    symbol = Column(String(10), nullable=False)
+    symbol = Column(String(20), nullable=False)
     timeframe = Column(String(10), nullable=False)
-    prediction_timestamp = Column(DateTime)
+    prediction_timestamp = Column(DateTime(timezone=True))
     observed_accuracy_pct = Column(Float)
     observed_mape = Column(Float)
     degradation_streak = Column(Integer, nullable=False, default=0)
     action = Column(String(50), nullable=False)
     model_version = Column(String(50))
     note = Column(String(500))
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
         Index('idx_monitor_symbol_timeframe_created', 'symbol', 'timeframe', 'created_at'),
@@ -123,19 +169,33 @@ def _get_db_url() -> str:
     return _create_db_url_from_config()
 
 
+def _configure_sqlite_engine(engine) -> None:
+    """Enable WAL and a busy timeout so scheduler/API/dashboard can share one file."""
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+        finally:
+            cursor.close()
+
+
 class DatabaseManager:
     def __init__(self, config=None, use_sqlite_fallback=False):
         # Expose model classes for callers that reference them via manager instance.
         self.MarketData = MarketData
         self.PredictionResults = PredictionResults
         self.ModelMonitorEvent = ModelMonitorEvent
+        self.Instrument = Instrument
+        self.IndexMembership = IndexMembership
         self.use_sqlite_fallback = use_sqlite_fallback
         try:
             if config is None:
-                # fall back to env 
+                # fall back to env
                 db_url = _get_db_url()
             else:
-                from urllib.parse import quote_plus
                 pwd_enc = quote_plus(config["password"])
                 host = config.get("host", "127.0.0.1")
                 port = config.get("port", 5432)
@@ -154,6 +214,8 @@ class DatabaseManager:
                 engine_kwargs["connect_args"] = {"connect_timeout": 5}
             self.engine = create_engine(db_url, **engine_kwargs)
             self.is_sqlite = db_url.startswith("sqlite")
+            if self.is_sqlite:
+                _configure_sqlite_engine(self.engine)
         except Exception as e:
             if self.use_sqlite_fallback:
                 self._activate_sqlite_fallback(e)
@@ -173,11 +235,15 @@ class DatabaseManager:
         return f"sqlite:///{sqlite_path}"
 
     def _activate_sqlite_fallback(self, reason) -> None:
-        print("\nWARNING: Unable to use PostgreSQL. Falling back to SQLite.")
-        print(f"{reason}")
+        import sys
+
+        # stderr keeps CLI stdout clean for JSON run reports
+        print("\nWARNING: Unable to use PostgreSQL. Falling back to SQLite.", file=sys.stderr)
+        print(f"{reason}", file=sys.stderr)
         db_url = self._sqlite_db_url()
         self.is_sqlite = True
         self.engine = create_engine(db_url, future=True)
+        _configure_sqlite_engine(self.engine)
         self.Session = sessionmaker(bind=self.engine, future=True)
 
     def _wait_for_db(self, tries=10, delay=1.5):
@@ -185,7 +251,7 @@ class DatabaseManager:
         # Skip DB check for SQLite since it always works
         if hasattr(self, 'is_sqlite') and self.is_sqlite:
             return
-            
+
         import time
         for i in range(tries):
             try:
@@ -227,65 +293,48 @@ class DatabaseManager:
                 time.sleep(delay)
 
     def create_tables(self):
+        """Bring the schema to the latest Alembic revision.
+
+        Databases populated before Alembic was introduced (old raw-DDL schema)
+        are stamped at the baseline revision first, then upgraded, so existing
+        daily history is migrated in place rather than recreated.
+        """
         self._wait_for_db()
-        Base.metadata.create_all(self.engine)
-        self._ensure_marketdata_schema()
-        self._ensure_prediction_schema()
+        self.run_migrations()
 
-    def _ensure_marketdata_schema(self):
+    def run_migrations(self, revision: str = "head"):
+        from alembic import command
+        from alembic.config import Config as AlembicConfig
+
+        migrations_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
+        cfg = AlembicConfig()
+        cfg.set_main_option("script_location", migrations_dir)
+        cfg.attributes["connectable"] = self.engine
+
         inspector = inspect(self.engine)
-        if "market_data" not in inspector.get_table_names():
-            return
+        tables = set(inspector.get_table_names())
+        if "market_data" in tables and "alembic_version" not in tables:
+            # Pre-Alembic database: mark the legacy schema as the baseline.
+            command.stamp(cfg, "0001")
+        command.upgrade(cfg, revision)
 
-        columns = {column["name"] for column in inspector.get_columns("market_data")}
-        with self.engine.begin() as conn:
-            if "timeframe" not in columns:
-                conn.execute(text("ALTER TABLE market_data ADD COLUMN timeframe VARCHAR(10) DEFAULT '1h'"))
-            conn.execute(text("UPDATE market_data SET timeframe = '1h' WHERE timeframe IS NULL"))
-            conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_marketdata_symbol_timeframe_timestamp "
-                    "ON market_data(symbol, timeframe, timestamp)"
-                )
-            )
-            conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_marketdata_exchange_timeframe_timestamp "
-                    "ON market_data(exchange, timeframe, timestamp)"
-                )
-            )
+    # ------------------------------------------------------------------
+    # Market data writes
+    # ------------------------------------------------------------------
 
-    def _ensure_prediction_schema(self):
-        inspector = inspect(self.engine)
-        if "prediction_results" not in inspector.get_table_names():
-            return
+    def insert_market_data(self, df: pd.DataFrame, exchange: Optional[str] = None) -> int:
+        """Chunked idempotent upsert keyed by (symbol, timeframe, timestamp).
 
-        columns = {column["name"] for column in inspector.get_columns("prediction_results")}
-        with self.engine.begin() as conn:
-            if "timeframe" not in columns:
-                conn.execute(text("ALTER TABLE prediction_results ADD COLUMN timeframe VARCHAR(10) DEFAULT '1h'"))
-            conn.execute(text("UPDATE prediction_results SET timeframe = '1h' WHERE timeframe IS NULL"))
-
-            conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_prediction_symbol_timeframe_timestamp "
-                    "ON prediction_results(symbol, timeframe, prediction_timestamp)"
-                )
-            )
-
-    def insert_market_data(self, df: pd.DataFrame, exchange: Optional[str] = None):
-        """Insert market data with handling for both PostgreSQL and SQLite."""
+        `exchange` is deprecated and optional; if provided (argument or column)
+        it is stored on the deprecated column for back-compat only.
+        """
         if df.empty:
-            return
+            return 0
 
-        # Ensure required columns are present
         required = {"symbol", "timestamp", "open", "high", "low", "close", "volume"}
         missing = required - set(df.columns)
         if missing:
             raise ValueError(f"Missing required columns: {sorted(missing)}")
-
-        if exchange is None and "exchange" not in df.columns:
-            raise ValueError("Exchange must be provided either as an argument or a dataframe column.")
 
         df = df.copy()
         numeric_columns = ["open", "high", "low", "close", "volume"]
@@ -294,53 +343,242 @@ class DatabaseManager:
         df = df.dropna(subset=["symbol", "timestamp", "open", "high", "low", "close"])
         df["volume"] = df["volume"].fillna(0.0)
         if df.empty:
-            return
+            return 0
+
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        if "timeframe" not in df.columns:
+            df["timeframe"] = "1h"
+        if "exchange" not in df.columns:
+            df["exchange"] = exchange
+
+        indicator_columns = [
+            "sma_20", "ema_12", "rsi", "macd", "macd_signal", "bollinger_upper", "bollinger_lower",
+        ]
+        rename_map = {
+            "open": "open_price", "high": "high_price", "low": "low_price", "close": "close_price",
+        }
+        insert_columns = (
+            ["symbol", "exchange", "timeframe", "timestamp",
+             "open_price", "high_price", "low_price", "close_price", "volume"]
+            + [column for column in indicator_columns if column in df.columns]
+        )
+        frame = df.rename(columns=rename_map)[insert_columns]
+        # Bulk upserts bypass ORM defaults, so created_at must be provided explicitly.
+        frame["created_at"] = datetime.now(timezone.utc)
+        # Last write wins on duplicate keys inside one payload.
+        frame = frame.drop_duplicates(subset=["symbol", "timeframe", "timestamp"], keep="last")
+
+        records = [
+            {key: (None if pd.isna(value) else value) for key, value in record.items()}
+            for record in frame.to_dict(orient="records")
+        ]
 
         if self.is_sqlite:
-            self._insert_market_data_sqlite(df, exchange)
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
         else:
-            self._insert_market_data_postgres(df, exchange)
-            
-    def _insert_market_data_postgres(self, df: pd.DataFrame, exchange: Optional[str]):
-        """Fast bulk upsert on PostgreSQL, deduped by (symbol, exchange, timestamp)."""
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
 
-        # Normalize to Python types that SQLAlchemy can handle
-        records = []
-        for _, row in df.iterrows():
-            records.append({
-                "symbol": row["symbol"],
-                "exchange": row["exchange"] if "exchange" in df.columns else exchange,
-                "timeframe": row["timeframe"] if "timeframe" in df.columns else "1h",
-                "timestamp": pd.to_datetime(row["timestamp"], utc=True).to_pydatetime(),
-                "open_price": float(row["open"]),
-                "high_price": float(row["high"]),
-                "low_price": float(row["low"]),
-                "close_price": float(row["close"]),
-                "volume": float(row["volume"]),
-                # indicators if present
-                "sma_20": float(row["sma_20"]) if "sma_20" in df.columns and pd.notna(row["sma_20"]) else None,
-                "ema_12": float(row["ema_12"]) if "ema_12" in df.columns and pd.notna(row["ema_12"]) else None,
-                "rsi": float(row["rsi"]) if "rsi" in df.columns and pd.notna(row["rsi"]) else None,
-                "macd": float(row["macd"]) if "macd" in df.columns and pd.notna(row["macd"]) else None,
-                "macd_signal": float(row["macd_signal"]) if "macd_signal" in df.columns and pd.notna(row["macd_signal"]) else None,
-                "bollinger_upper": float(row["bollinger_upper"]) if "bollinger_upper" in df.columns and pd.notna(row["bollinger_upper"]) else None,
-                "bollinger_lower": float(row["bollinger_lower"]) if "bollinger_lower" in df.columns and pd.notna(row["bollinger_lower"]) else None,
-            })
+        total = 0
+        for start in range(0, len(records), UPSERT_CHUNK_SIZE):
+            chunk = records[start:start + UPSERT_CHUNK_SIZE]
+            stmt = dialect_insert(MarketData).values(chunk)
+            update_cols = {
+                c.name: stmt.excluded[c.name]
+                for c in MarketData.__table__.columns
+                if c.name not in ("id", "created_at", "symbol", "timeframe", "timestamp")
+            }
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["symbol", "timeframe", "timestamp"],
+                set_=update_cols,
+            )
+            with self.engine.begin() as conn:
+                conn.execute(stmt)
+            total += len(chunk)
+        return total
 
-        stmt = pg_insert(MarketData).values(records)
-        update_cols = {
-            c.name: stmt.excluded[c.name]
-            for c in MarketData.__table__.columns
-            if c.name not in ("id", "created_at")  # don't overwrite id/created_at
-        }
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["symbol", "exchange", "timestamp"],
-            set_=update_cols,
-        )
+    def get_watermarks(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        timeframe: str = "1h",
+    ) -> pd.DataFrame:
+        """Latest stored bar per symbol for a timeframe: columns (symbol, max_timestamp)."""
+        from sqlalchemy import func, select
 
-        with self.engine.begin() as conn:
-            conn.execute(stmt)
+        with self.engine.connect() as conn:
+            stmt = (
+                select(
+                    MarketData.symbol.label("symbol"),
+                    func.max(MarketData.timestamp).label("max_timestamp"),
+                )
+                .where(MarketData.timeframe == timeframe)
+                .group_by(MarketData.symbol)
+            )
+            if symbols:
+                normalized = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+                if normalized:
+                    stmt = stmt.where(MarketData.symbol.in_(normalized))
+            df = pd.read_sql(stmt, conn)
+
+        if not df.empty:
+            df["max_timestamp"] = pd.to_datetime(df["max_timestamp"], utc=True)
+        return df
+
+    # ------------------------------------------------------------------
+    # Instruments and index membership
+    # ------------------------------------------------------------------
+
+    def upsert_instruments(self, records: Iterable[dict]) -> int:
+        """Insert or update instrument metadata keyed by symbol."""
+        records = list(records)
+        if not records:
+            return 0
+
+        updatable = ("name", "exchange", "sector", "currency", "kind", "active", "first_seen", "last_seen")
+        with self.Session() as session:
+            for record in records:
+                symbol = str(record["symbol"]).strip().upper()
+                existing = session.get(Instrument, symbol)
+                if existing is None:
+                    existing = Instrument(symbol=symbol)
+                    session.add(existing)
+                for key in updatable:
+                    if key in record and record[key] is not None:
+                        setattr(existing, key, record[key])
+            session.commit()
+        return len(records)
+
+    def get_instruments(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        kind: Optional[str] = None,
+        active: Optional[bool] = None,
+    ) -> pd.DataFrame:
+        from sqlalchemy import select
+
+        with self.engine.connect() as conn:
+            stmt = select(Instrument)
+            if symbols:
+                normalized = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+                if normalized:
+                    stmt = stmt.where(Instrument.symbol.in_(normalized))
+            if kind:
+                stmt = stmt.where(Instrument.kind == kind)
+            if active is not None:
+                stmt = stmt.where(Instrument.active.is_(active))
+            df = pd.read_sql(stmt.order_by(Instrument.symbol.asc()), conn)
+        return df
+
+    def get_open_memberships(self, index_symbol: str) -> pd.DataFrame:
+        from sqlalchemy import select
+
+        with self.engine.connect() as conn:
+            stmt = (
+                select(IndexMembership)
+                .where(
+                    IndexMembership.index_symbol == index_symbol,
+                    IndexMembership.effective_to.is_(None),
+                )
+                .order_by(IndexMembership.symbol.asc())
+            )
+            return pd.read_sql(stmt, conn)
+
+    def get_membership_intervals(self, index_symbol: str) -> pd.DataFrame:
+        """All membership rows (open and closed) for point-in-time reconstruction."""
+        from sqlalchemy import select
+
+        with self.engine.connect() as conn:
+            stmt = (
+                select(IndexMembership)
+                .where(IndexMembership.index_symbol == index_symbol)
+                .order_by(IndexMembership.symbol.asc(), IndexMembership.effective_from.asc())
+            )
+            df = pd.read_sql(stmt, conn)
+
+        if not df.empty:
+            df["effective_from"] = pd.to_datetime(df["effective_from"])
+            df["effective_to"] = pd.to_datetime(df["effective_to"])
+        return df
+
+    def get_members_asof(self, index_symbol: str, asof: date) -> List[str]:
+        from sqlalchemy import or_, select
+
+        asof = pd.to_datetime(asof).date()
+        with self.engine.connect() as conn:
+            stmt = (
+                select(IndexMembership.symbol)
+                .where(
+                    IndexMembership.index_symbol == index_symbol,
+                    IndexMembership.effective_from <= asof,
+                    or_(
+                        IndexMembership.effective_to.is_(None),
+                        IndexMembership.effective_to > asof,
+                    ),
+                )
+                .distinct()
+                .order_by(IndexMembership.symbol.asc())
+            )
+            rows = conn.execute(stmt).fetchall()
+        return [str(row[0]).upper() for row in rows]
+
+    def open_membership(
+        self,
+        index_symbol: str,
+        symbol: str,
+        effective_from: date,
+        source: str = "manual",
+    ) -> None:
+        symbol = str(symbol).strip().upper()
+        effective_from = pd.to_datetime(effective_from).date()
+        with self.Session() as session:
+            existing = (
+                session.query(IndexMembership)
+                .filter(
+                    IndexMembership.index_symbol == index_symbol,
+                    IndexMembership.symbol == symbol,
+                    IndexMembership.effective_to.is_(None),
+                )
+                .first()
+            )
+            if existing is not None:
+                return
+            session.add(
+                IndexMembership(
+                    index_symbol=index_symbol,
+                    symbol=symbol,
+                    effective_from=effective_from,
+                    effective_to=None,
+                    source=source,
+                )
+            )
+            session.commit()
+
+    def close_membership(
+        self,
+        index_symbol: str,
+        symbol: str,
+        effective_to: date,
+    ) -> None:
+        symbol = str(symbol).strip().upper()
+        effective_to = pd.to_datetime(effective_to).date()
+        with self.Session() as session:
+            open_rows = (
+                session.query(IndexMembership)
+                .filter(
+                    IndexMembership.index_symbol == index_symbol,
+                    IndexMembership.symbol == symbol,
+                    IndexMembership.effective_to.is_(None),
+                )
+                .all()
+            )
+            for row in open_rows:
+                row.effective_to = effective_to
+            if open_rows:
+                session.commit()
+
+    # ------------------------------------------------------------------
+    # Market data reads
+    # ------------------------------------------------------------------
 
     def get_latest_data(
         self,
@@ -719,50 +957,3 @@ class DatabaseManager:
         if "created_at" in df.columns:
             df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
         return df.sort_values("created_at", ascending=False).reset_index(drop=True)
-        
-    def _insert_market_data_sqlite(self, df: pd.DataFrame, exchange: Optional[str]):
-        """SQLite implementation for inserting market data."""
-        # Convert DataFrame to SQLAlchemy-compatible records
-        records = []
-        for _, row in df.iterrows():
-            record = {
-                "symbol": row["symbol"],
-                "exchange": row["exchange"] if "exchange" in df.columns else exchange,
-                "timeframe": row["timeframe"] if "timeframe" in df.columns else "1h",
-                "timestamp": pd.to_datetime(row["timestamp"], utc=True).to_pydatetime(),
-                "open_price": float(row["open"]),
-                "high_price": float(row["high"]),
-                "low_price": float(row["low"]),
-                "close_price": float(row["close"]),
-                "volume": float(row["volume"]),
-                # indicators if present
-                "sma_20": float(row["sma_20"]) if "sma_20" in df.columns and pd.notna(row["sma_20"]) else None,
-                "ema_12": float(row["ema_12"]) if "ema_12" in df.columns and pd.notna(row["ema_12"]) else None,
-                "rsi": float(row["rsi"]) if "rsi" in df.columns and pd.notna(row["rsi"]) else None,
-                "macd": float(row["macd"]) if "macd" in df.columns and pd.notna(row["macd"]) else None,
-                "macd_signal": float(row["macd_signal"]) if "macd_signal" in df.columns and pd.notna(row["macd_signal"]) else None,
-                "bollinger_upper": float(row["bollinger_upper"]) if "bollinger_upper" in df.columns and pd.notna(row["bollinger_upper"]) else None,
-                "bollinger_lower": float(row["bollinger_lower"]) if "bollinger_lower" in df.columns and pd.notna(row["bollinger_lower"]) else None,
-            }
-            records.append(record)
-
-        # For SQLite, we need to manually check and update existing records
-        with self.Session() as session:
-            for record in records:
-                # Check if a record with the same symbol, exchange, and timestamp exists
-                existing = session.query(MarketData).filter(
-                    MarketData.symbol == record["symbol"],
-                    MarketData.exchange == record["exchange"],
-                    MarketData.timestamp == record["timestamp"]
-                ).first()
-                
-                if existing:
-                    # Update existing record
-                    for key, value in record.items():
-                        if key not in ("id", "created_at"):
-                            setattr(existing, key, value)
-                else:
-                    # Insert new record
-                    session.add(MarketData(**record))
-            
-            session.commit()

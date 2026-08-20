@@ -1,12 +1,66 @@
+import threading
+import uuid
+from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .dependencies import get_automation_agent
+from .dependencies import get_automation_agent, get_ingestion_service
+
+
+# ---------------------------------------------------------------------------
+# Background ingestion run registry (in-memory, last N runs)
+# ---------------------------------------------------------------------------
+
+_MAX_TRACKED_RUNS = 50
+_runs: "OrderedDict[str, dict]" = OrderedDict()
+_runs_lock = threading.Lock()
+
+
+def _register_run(job: str) -> str:
+    job_id = uuid.uuid4().hex
+    with _runs_lock:
+        _runs[job_id] = {
+            "job_id": job_id,
+            "job": job,
+            "status": "running",
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "result": None,
+        }
+        while len(_runs) > _MAX_TRACKED_RUNS:
+            _runs.popitem(last=False)
+    return job_id
+
+
+def _run_job(job_id: str, func: Callable[[], dict]) -> None:
+    try:
+        result = func()
+        status = "completed"
+    except Exception as exc:  # noqa: BLE001 - report, never crash the worker
+        result = {"error": str(exc)}
+        status = "failed"
+    with _runs_lock:
+        if job_id in _runs:
+            _runs[job_id]["status"] = status
+            _runs[job_id]["result"] = result
+            _runs[job_id]["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _submit_background(background_tasks: BackgroundTasks, job: str, func: Callable[[], dict]) -> dict:
+    job_id = _register_run(job)
+    background_tasks.add_task(_run_job, job_id, func)
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "job": job,
+        "message": f"{job} started in the background. Poll GET /ingestion/runs for the result.",
+    }
 
 
 class CollectRequest(BaseModel):
@@ -144,14 +198,14 @@ def health(agent: Any = Depends(get_automation_agent)):
 
 
 @app.post("/market-data/collect")
-def collect_market_data(request: CollectRequest, agent: Any = Depends(get_automation_agent)):
+def collect_market_data(request: CollectRequest, service: Any = Depends(get_ingestion_service)):
     try:
-        return agent.collect_market_data(
+        return service.collect(
             symbols=request.symbols or None,
-            period=request.period,
-            interval=request.interval,
+            timeframe=request.interval,
             start=request.start,
             end=request.end,
+            period=None if (request.start or request.end) else request.period,
             batch_size=request.batch_size,
         )
     except Exception as exc:
@@ -159,15 +213,15 @@ def collect_market_data(request: CollectRequest, agent: Any = Depends(get_automa
 
 
 @app.post("/market-data/collect-universe")
-def collect_market_universe(request: UniverseCollectRequest, agent: Any = Depends(get_automation_agent)):
+def collect_market_universe(request: UniverseCollectRequest, service: Any = Depends(get_ingestion_service)):
     try:
-        return agent.collect_market_universe(
-            universe=request.universe,
+        return service.collect(
             symbols=request.symbols or None,
-            period=request.period,
-            interval=request.interval,
+            universe=request.universe,
+            timeframe=request.interval,
             start=request.start,
             end=request.end,
+            period=None if (request.start or request.end) else request.period,
             batch_size=request.batch_size,
         )
     except Exception as exc:
@@ -175,43 +229,133 @@ def collect_market_universe(request: UniverseCollectRequest, agent: Any = Depend
 
 
 @app.post("/backfill/daily")
-def backfill_daily(request: DailyBackfillRequest, agent: Any = Depends(get_automation_agent)):
-    try:
-        return agent.backfill_daily_history(
+def backfill_daily(
+    request: DailyBackfillRequest,
+    background_tasks: BackgroundTasks,
+    service: Any = Depends(get_ingestion_service),
+):
+    return _submit_background(
+        background_tasks,
+        "backfill_daily",
+        lambda: service.backfill_daily(
             universe=request.universe,
             symbols=request.symbols or None,
             start=request.start,
             end=request.end,
             batch_size=request.batch_size,
-        )
-    except Exception as exc:
-        _handle_service_error(exc)
+        ),
+    )
 
 
 @app.post("/backfill/hourly")
-def backfill_hourly(request: HourlyBackfillRequest, agent: Any = Depends(get_automation_agent)):
-    try:
-        return agent.backfill_hourly_history(
+def backfill_hourly(
+    request: HourlyBackfillRequest,
+    background_tasks: BackgroundTasks,
+    service: Any = Depends(get_ingestion_service),
+):
+    return _submit_background(
+        background_tasks,
+        "backfill_hourly",
+        lambda: service.backfill_hourly(
             universe=request.universe,
             symbols=request.symbols or None,
-            period=request.period,
             end=request.end,
             batch_size=request.batch_size,
+        ),
+    )
+
+
+@app.post("/backfill/sp500")
+def backfill_sp500(
+    request: Sp500BackfillRequest,
+    background_tasks: BackgroundTasks,
+    service: Any = Depends(get_ingestion_service),
+):
+    def _run() -> dict:
+        daily = service.backfill_daily(
+            universe="sp500", start=request.daily_start, end=request.daily_end,
+            batch_size=request.batch_size,
         )
+        hourly = service.backfill_hourly(
+            universe="sp500", end=request.hourly_end, batch_size=request.batch_size,
+        )
+        return {
+            "universe": "sp500",
+            "daily": daily,
+            "hourly": hourly,
+            "message": "Completed S&P 500 daily and hourly history backfills.",
+        }
+
+    return _submit_background(background_tasks, "backfill_sp500", _run)
+
+
+@app.get("/ingestion/runs")
+def ingestion_runs(job_id: Optional[str] = Query(None)):
+    with _runs_lock:
+        if job_id:
+            run = _runs.get(job_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail=f"Unknown job id: {job_id}")
+            return run
+        return {"runs": list(reversed(_runs.values()))}
+
+
+@app.post("/ingestion/membership/refresh")
+def refresh_membership(
+    background_tasks: BackgroundTasks,
+    service: Any = Depends(get_ingestion_service),
+):
+    return _submit_background(background_tasks, "membership_refresh", service.refresh_membership)
+
+
+@app.get("/ingestion/membership")
+def get_membership(
+    asof: Optional[str] = Query(None, description="Point-in-time date (YYYY-MM-DD); default: current."),
+    service: Any = Depends(get_ingestion_service),
+):
+    try:
+        if asof:
+            members = service.db.get_members_asof(service.membership.index_symbol, asof)
+        else:
+            members = service.membership.current_members()
+        return {
+            "index_symbol": service.membership.index_symbol,
+            "asof": asof or "current",
+            "member_count": len(members),
+            "members": members,
+        }
     except Exception as exc:
         _handle_service_error(exc)
 
 
-@app.post("/backfill/sp500")
-def backfill_sp500(request: Sp500BackfillRequest, agent: Any = Depends(get_automation_agent)):
+@app.post("/ingestion/aggregates/recompute")
+def recompute_aggregates(
+    background_tasks: BackgroundTasks,
+    timeframe: str = Query("1d"),
+    full: bool = Query(False),
+    service: Any = Depends(get_ingestion_service),
+):
+    return _submit_background(
+        background_tasks,
+        "recompute_aggregates",
+        lambda: service.recompute_aggregates(timeframe=timeframe, full=full),
+    )
+
+
+@app.get("/instruments")
+def list_instruments(
+    kind: Optional[str] = Query(None),
+    active: Optional[bool] = Query(None),
+    service: Any = Depends(get_ingestion_service),
+):
     try:
-        return agent.backfill_sp500_history(
-            daily_start=request.daily_start,
-            daily_end=request.daily_end,
-            hourly_period=request.hourly_period,
-            hourly_end=request.hourly_end,
-            batch_size=request.batch_size,
-        )
+        instruments = service.db.get_instruments(kind=kind, active=active)
+        rows = instruments.to_dict(orient="records")
+        for row in rows:
+            for key in ("first_seen", "last_seen", "created_at", "updated_at"):
+                if row.get(key) is not None and not isinstance(row[key], str):
+                    row[key] = pd.to_datetime(row[key], utc=True).isoformat()
+        return {"count": len(rows), "instruments": rows}
     except Exception as exc:
         _handle_service_error(exc)
 

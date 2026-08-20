@@ -113,6 +113,37 @@ services:
     networks:
       - financial_net
 
+  # Background ingestion scheduler (hourly/daily collection, membership refresh,
+  # sector aggregates, gap repair). Optional: start it with
+  #   docker compose up -d financial_scheduler
+  # Deployable standalone on AWS ECS/EC2 - it only needs the DB env vars.
+  financial_scheduler:
+    build: .
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    depends_on:
+      - postgres
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-financial_data}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - ENABLE_SQLITE_FALLBACK=${ENABLE_SQLITE_FALLBACK:-false}
+      - SCHEDULER_ENABLED=true
+      - SCHEDULER_TIMEZONE=${SCHEDULER_TIMEZONE:-America/New_York}
+      - INGESTION_HOURLY_UNIVERSE=${INGESTION_HOURLY_UNIVERSE:-all}
+      - INGESTION_DAILY_UNIVERSE=${INGESTION_DAILY_UNIVERSE:-all}
+      - DOWNLOAD_BATCH_SIZE=${DOWNLOAD_BATCH_SIZE:-25}
+      - INTER_BATCH_DELAY_S=${INTER_BATCH_DELAY_S:-1.0}
+      - HOME=/tmp
+      - XDG_DATA_HOME=/tmp/.local/share
+    command: ["python", "-m", "ingestion.cli", "serve"]
+    volumes:
+      - ./src:/app/src
+      - ./logs:/app/logs
+    networks:
+      - financial_net
+
 volumes:
   postgres_data:
   ollama_data:
